@@ -49,10 +49,10 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
             controller: scannerController,
             onDetect: _onScanComplete,
           ),
-          Align(
+          const Align(
             alignment: Alignment.bottomCenter,
             child: Padding(
-              padding: const EdgeInsets.all(24),
+              padding: EdgeInsets.all(24),
               child: Text(
                 'Point camera at QR code containing WebSocket URL',
                 style: TextStyle(
