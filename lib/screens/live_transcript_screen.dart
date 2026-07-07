@@ -19,6 +19,8 @@ class LiveTranscriptScreen extends StatefulWidget {
 }
 
 class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
+  String? _selectedLanguage; // null = show all
+  final Set<String> _availableLanguages = {};
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
   bool _isConnected = false;
@@ -234,44 +236,55 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   Future<void> _handleMessage(Map<String, dynamic> json) async {
     debugPrint('📩 JSON keys: ${json.keys}');
-    debugPrint('🔤 seq: "${json['seq']}"');
 
-    // Extract transcript only from 'seq'
     String transcriptText = (json['seq'] ?? '').toString().trim();
     if (transcriptText.isEmpty) {
-      // This is not a transcript message – ignore it
       debugPrint('⏭️ Skipping message with empty seq');
       return;
     }
 
+    String language = (json['lid'] ?? 'unknown').toString();
+    // Add to available languages for the dropdown
+    if (language != 'unknown') {
+      _availableLanguages.add(language);
+    }
+
     final message = TranscriptMessage(
       transcript: transcriptText,
-      translations: {}, // add real translations later if present
+      translations: {},
       timestamp: DateTime.now(),
+      language: language,
     );
 
-    // Save to Firestore (if available) and update UI
+    // Save to Firestore (always)
     if (_transcriptsRef != null) {
       try {
         await _transcriptsRef!.add({
           'transcript': message.transcript,
           'translations': message.translations,
           'timestamp': Timestamp.fromDate(message.timestamp),
+          'language': message.language,
         });
       } catch (e) {
         debugPrint('⚠️ Could not save to Firestore: $e');
       }
     }
 
-    setState(() {
-      _latestMessage = message;
-      _isConnected = true;
-      _isConnecting = false;
-    });
+    // Filter before updating UI
+    if (_selectedLanguage == null || message.language == _selectedLanguage) {
+      setState(() {
+        _latestMessage = message;
+        _isConnected = true;
+        _isConnecting = false;
+      });
 
-    // TTS – only speak if the transcript is not raw JSON (optional)
-    if (_ttsEnabled && message.transcript.isNotEmpty && !message.transcript.startsWith('{')) {
-      await _flutterTts.speak(message.transcript);
+      // TTS – speak only if filter matches (or all)
+      if (_ttsEnabled &&
+          message.transcript.isNotEmpty &&
+          !message.transcript.startsWith('{') &&
+          (_selectedLanguage == null || message.language == _selectedLanguage)) {
+        await _flutterTts.speak(message.transcript);
+      }
     }
   }
 
@@ -317,11 +330,36 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       appBar: AppBar(
         title: const Text('Live Transcript'),
         actions: [
+          // TTS toggle
           IconButton(
             icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off),
             onPressed: _toggleTts,
             tooltip: 'Toggle TTS',
           ),
+          // Language filter dropdown
+          if (_availableLanguages.isNotEmpty)
+            DropdownButton<String>(
+              value: _selectedLanguage,
+              hint: const Text('All'),
+              items: [
+                const DropdownMenuItem<String>(
+                  value: null,
+                  child: Text('All (transcript)'),
+                ),
+                ..._availableLanguages.map((lang) {
+                  return DropdownMenuItem<String>(
+                    value: lang,
+                    child: Text(lang.toUpperCase()),
+                  );
+                }), // removed .toList()
+              ],
+              onChanged: (newLang) {
+                setState(() {
+                  _selectedLanguage = newLang;
+                });
+              },
+            ),
+          // QR scanner button
           IconButton(
             icon: const Icon(Icons.qr_code_scanner),
             onPressed: _scanNewQR,
@@ -343,6 +381,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 ),
                 const SizedBox(width: 8),
                 Text(_isConnected ? 'Live connection' : (_isConnecting ? 'Connecting...' : 'Disconnected')),
+                
+                if (_selectedLanguage != null) ...[
+                  const SizedBox(width: 12),
+                  Chip(
+                    label: Text('Filter: ${_selectedLanguage!.toUpperCase()}'),
+                    backgroundColor: Colors.blue.shade100,
+                    deleteIcon: const Icon(Icons.close, size: 16),
+                    onDeleted: () {
+                      setState(() {
+                        _selectedLanguage = null;
+                      });
+                    },
+                  ),
+                ],
+                
                 if (_errorMessage != null) ...[
                   const SizedBox(width: 16),
                   Expanded(
@@ -367,63 +420,63 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             child: Center(
               child: _latestMessage == null
                   ? const Text('Waiting for transcript...')
-                  :SelectionArea(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.all(24),
-                      child: Card(
-                        elevation: 4,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  const Icon(Icons.record_voice_over, size: 28),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      _latestMessage!.transcript,
-                                      style: const TextStyle(
-                                        fontSize: 24,
-                                        fontWeight: FontWeight.bold,
+                  : SelectionArea(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(24),
+                        child: Card(
+                          elevation: 4,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.all(24),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Icon(Icons.record_voice_over, size: 28),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: Text(
+                                        _latestMessage!.transcript,
+                                        style: const TextStyle(
+                                          fontSize: 24,
+                                          fontWeight: FontWeight.bold,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                  Text(
-                                    '${_latestMessage!.timestamp.hour.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.minute.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.second.toString().padLeft(2, '0')}',
-                                    style: const TextStyle(fontSize: 12),
-                                  ),
-                                ],
-                              ),
-                              if (_latestMessage!.translations.isNotEmpty) ...[
-                                const Divider(height: 32),
-                                Wrap(
-                                  spacing: 16,
-                                  runSpacing: 12,
-                                  children: _latestMessage!.translations.entries
-                                      .map((entry) => Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              Text(
-                                                entry.key.toUpperCase(),
-                                                style: const TextStyle(
-                                                  fontWeight: FontWeight.bold,
-                                                  fontSize: 14,
+                                    Text(
+                                      '${_latestMessage!.timestamp.hour.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.minute.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.second.toString().padLeft(2, '0')}',
+                                      style: const TextStyle(fontSize: 12),
+                                    ),
+                                  ],
+                                ),
+                                if (_latestMessage!.translations.isNotEmpty) ...[
+                                  const Divider(height: 32),
+                                  Wrap(
+                                    spacing: 16,
+                                    runSpacing: 12,
+                                    children: _latestMessage!.translations.entries
+                                        .map((entry) => Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  entry.key.toUpperCase(),
+                                                  style: const TextStyle(
+                                                    fontWeight: FontWeight.bold,
+                                                    fontSize: 14,
+                                                  ),
                                                 ),
-                                              ),
-                                              const SizedBox(height: 4),
-                                              Text(
-                                                entry.value,
-                                                style: const TextStyle(fontSize: 16),
-                                              ),
-                                            ],
-                                          ))
-                                      .toList(),
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  entry.value,
+                                                  style: const TextStyle(fontSize: 16),
+                                                ),
+                                              ],
+                                            ))
+                                        .toList(), // added .toList()
                                   ),
                                 ],
                               ],
