@@ -168,6 +168,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   void _parseSSEEvent(String eventBlock) {
+    debugPrint('📦 Full SSE event block:\n$eventBlock');
     final lines = eventBlock.split('\n');
     StringBuffer dataBuffer = StringBuffer();
 
@@ -231,19 +232,25 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
-  // ─── Shared message handler ─────────────────────────────
   Future<void> _handleMessage(Map<String, dynamic> json) async {
-    TranscriptMessage message;
-    try {
-      message = TranscriptMessage.fromJson(json);
-    } catch (e) {
-      message = TranscriptMessage(
-        transcript: json.toString(),
-        translations: {},
-        timestamp: DateTime.now(),
-      );
+    debugPrint('📩 JSON keys: ${json.keys}');
+    debugPrint('🔤 seq: "${json['seq']}"');
+
+    // Extract transcript only from 'seq'
+    String transcriptText = (json['seq'] ?? '').toString().trim();
+    if (transcriptText.isEmpty) {
+      // This is not a transcript message – ignore it
+      debugPrint('⏭️ Skipping message with empty seq');
+      return;
     }
 
+    final message = TranscriptMessage(
+      transcript: transcriptText,
+      translations: {}, // add real translations later if present
+      timestamp: DateTime.now(),
+    );
+
+    // Save to Firestore (if available) and update UI
     if (_transcriptsRef != null) {
       try {
         await _transcriptsRef!.add({
@@ -262,7 +269,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = false;
     });
 
-    if (_ttsEnabled && message.transcript.isNotEmpty) {
+    // TTS – only speak if the transcript is not raw JSON (optional)
+    if (_ttsEnabled && message.transcript.isNotEmpty && !message.transcript.startsWith('{')) {
       await _flutterTts.speak(message.transcript);
     }
   }
@@ -359,7 +367,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             child: Center(
               child: _latestMessage == null
                   ? const Text('Waiting for transcript...')
-                  : SingleChildScrollView(
+                  :SelectionArea(
+                    child: SingleChildScrollView(
                       padding: const EdgeInsets.all(24),
                       child: Card(
                         elevation: 4,
@@ -415,9 +424,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                                             ],
                                           ))
                                       .toList(),
-                                ),
+                                  ),
+                                ],
                               ],
-                            ],
+                            ),
                           ),
                         ),
                       ),
