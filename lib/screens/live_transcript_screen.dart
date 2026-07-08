@@ -21,6 +21,9 @@ class LiveTranscriptScreen extends StatefulWidget {
 class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _selectedLanguage; // null = show all
   final Set<String> _availableLanguages = {};
+  final List<TranscriptMessage> _messages = [];
+  bool _defaultFilterSet = false; // set once when first message arrives
+
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
   bool _isConnected = false;
@@ -34,9 +37,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   // Firestore
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
-
-  // UI state
-  TranscriptMessage? _latestMessage;
 
   bool get _isDesktop {
     if (kIsWeb) return false;
@@ -100,9 +100,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _errorMessage = null;
       _isConnected = false;
       _isConnecting = true;
+      _messages.clear();
+      _availableLanguages.clear();
+      _defaultFilterSet = false; // reset on reconnect
+      _selectedLanguage = null;
     });
 
-    // SSE uses HTTP/HTTPS
     if (url.startsWith('http://') || url.startsWith('https://')) {
       _connectSSE(url);
     } else {
@@ -178,7 +181,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       if (line.startsWith('data:')) {
         dataBuffer.writeln(line.substring(5).trim());
       }
-      // We ignore 'event:' lines for now; they aren't needed.
     }
 
     final data = dataBuffer.toString().trim();
@@ -234,8 +236,42 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
+  // ─── Language extraction from sender ────────────────────
+  String _extractLanguageFromSender(String sender) {
+    // ASR sender → Transcript
+    if (sender.startsWith('asr')) {
+      return 'Transcript';
+    }
+
+    // Try to extract language code from sender like "textstructurer:0_en"
+    final parts = sender.split('_');
+    if (parts.length > 1) {
+      final code = parts.last;
+      // Map common codes to display names
+      switch (code) {
+        case 'en': return 'English';
+        case 'de': return 'German';
+        case 'fr': return 'French';
+        case 'zh': return 'Chinese';
+        case 'it': return 'Italian';
+        case 'ja': return 'Japanese';
+        case 'fa': return 'Persian';
+        case 'ru': return 'Russian';
+        case 'es': return 'Spanish';
+        case 'vi': return 'Vietnamese';
+        default: return code.toUpperCase();
+      }
+    }
+
+    // Fallback: if sender starts with "mt:" we could map index to language,
+    // but it's simpler to return 'unknown'.
+    return 'unknown';
+  }
+
+  // ─── Message handler ─────────────────────────────────────
   Future<void> _handleMessage(Map<String, dynamic> json) async {
     debugPrint('📩 JSON keys: ${json.keys}');
+    debugPrint('🔍 sender: "${json['sender']}"');
 
     String transcriptText = (json['seq'] ?? '').toString().trim();
     if (transcriptText.isEmpty) {
@@ -243,10 +279,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
 
-    String language = (json['lid'] ?? 'unknown').toString();
-    // Add to available languages for the dropdown
-    if (language != 'unknown') {
-      _availableLanguages.add(language);
+    // Extract language from sender
+    final sender = json['sender'] ?? '';
+    final language = _extractLanguageFromSender(sender);
+    _availableLanguages.add(language);
+
+    // Set default filter to the first language (usually 'Transcript')
+    if (!_defaultFilterSet) {
+      _selectedLanguage = language;
+      _defaultFilterSet = true;
     }
 
     final message = TranscriptMessage(
@@ -256,7 +297,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       language: language,
     );
 
-    // Save to Firestore (always)
+    _messages.add(message);
+
     if (_transcriptsRef != null) {
       try {
         await _transcriptsRef!.add({
@@ -270,24 +312,24 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
     }
 
-    // Filter before updating UI
-    if (_selectedLanguage == null || message.language == _selectedLanguage) {
-      setState(() {
-        _latestMessage = message;
-        _isConnected = true;
-        _isConnecting = false;
-      });
+    setState(() {
+      _isConnected = true;
+      _isConnecting = false;
+    });
 
-      // TTS – speak only if filter matches (or all)
-      if (_ttsEnabled &&
-          message.transcript.isNotEmpty &&
-          !message.transcript.startsWith('{') &&
-          (_selectedLanguage == null || message.language == _selectedLanguage)) {
+    // TTS – speak only if filter matches (or all)
+    bool shouldSpeak = _ttsEnabled &&
+        message.transcript.isNotEmpty &&
+        !message.transcript.startsWith('{');
+    if (shouldSpeak) {
+      if (_selectedLanguage == null ||
+          message.language.toLowerCase() == _selectedLanguage!.toLowerCase()) {
         await _flutterTts.speak(message.transcript);
       }
     }
   }
 
+  // ─── Helpers ────────────────────────────────────────────
   void _reconnect() {
     _channel?.sink.close();
     _sseSubscription?.cancel();
@@ -324,19 +366,30 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     super.dispose();
   }
 
+  // ─── Build ───────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
+    // Filter messages
+    List<TranscriptMessage> filteredMessages;
+    if (_selectedLanguage == null) {
+      filteredMessages = List.from(_messages);
+    } else {
+      filteredMessages = _messages
+          .where((msg) =>
+              msg.language.toLowerCase() == _selectedLanguage!.toLowerCase())
+          .toList();
+    }
+    filteredMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Live Transcript'),
         actions: [
-          // TTS toggle
           IconButton(
             icon: Icon(_ttsEnabled ? Icons.volume_up : Icons.volume_off),
             onPressed: _toggleTts,
             tooltip: 'Toggle TTS',
           ),
-          // Language filter dropdown
           if (_availableLanguages.isNotEmpty)
             DropdownButton<String>(
               value: _selectedLanguage,
@@ -349,9 +402,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 ..._availableLanguages.map((lang) {
                   return DropdownMenuItem<String>(
                     value: lang,
-                    child: Text(lang.toUpperCase()),
+                    child: Text(lang == 'unknown' ? 'Unknown' : lang),
                   );
-                }), // removed .toList()
+                }),
               ],
               onChanged: (newLang) {
                 setState(() {
@@ -359,7 +412,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 });
               },
             ),
-          // QR scanner button
           IconButton(
             icon: const Icon(Icons.qr_code_scanner),
             onPressed: _scanNewQR,
@@ -381,11 +433,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 ),
                 const SizedBox(width: 8),
                 Text(_isConnected ? 'Live connection' : (_isConnecting ? 'Connecting...' : 'Disconnected')),
-                
                 if (_selectedLanguage != null) ...[
                   const SizedBox(width: 12),
                   Chip(
-                    label: Text('Filter: ${_selectedLanguage!.toUpperCase()}'),
+                    label: Text('Filter: ${_selectedLanguage == 'unknown' ? 'Unknown' : _selectedLanguage}'),
                     backgroundColor: Colors.blue.shade100,
                     deleteIcon: const Icon(Icons.close, size: 16),
                     onDeleted: () {
@@ -395,7 +446,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                     },
                   ),
                 ],
-                
                 if (_errorMessage != null) ...[
                   const SizedBox(width: 16),
                   Expanded(
@@ -417,75 +467,52 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             ),
           ),
           Expanded(
-            child: Center(
-              child: _latestMessage == null
-                  ? const Text('Waiting for transcript...')
-                  : SelectionArea(
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.all(24),
-                        child: Card(
-                          elevation: 4,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Padding(
-                            padding: const EdgeInsets.all(24),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    const Icon(Icons.record_voice_over, size: 28),
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Text(
-                                        _latestMessage!.transcript,
-                                        style: const TextStyle(
-                                          fontSize: 24,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
+            child: filteredMessages.isEmpty
+                ? Center(
+                    child: Text(
+                      _messages.isEmpty
+                          ? 'Waiting for transcript...'
+                          : 'No messages in ${_selectedLanguage == 'unknown' ? 'Unknown' : _selectedLanguage}',
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: filteredMessages.length,
+                    itemBuilder: (context, index) {
+                      final msg = filteredMessages[index];
+                      return Card(
+                        elevation: 2,
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      msg.transcript,
+                                      style: const TextStyle(fontSize: 18),
                                     ),
-                                    Text(
-                                      '${_latestMessage!.timestamp.hour.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.minute.toString().padLeft(2, '0')}:${_latestMessage!.timestamp.second.toString().padLeft(2, '0')}',
-                                      style: const TextStyle(fontSize: 12),
-                                    ),
-                                  ],
-                                ),
-                                if (_latestMessage!.translations.isNotEmpty) ...[
-                                  const Divider(height: 32),
-                                  Wrap(
-                                    spacing: 16,
-                                    runSpacing: 12,
-                                    children: _latestMessage!.translations.entries
-                                        .map((entry) => Column(
-                                              crossAxisAlignment: CrossAxisAlignment.start,
-                                              children: [
-                                                Text(
-                                                  entry.key.toUpperCase(),
-                                                  style: const TextStyle(
-                                                    fontWeight: FontWeight.bold,
-                                                    fontSize: 14,
-                                                  ),
-                                                ),
-                                                const SizedBox(height: 4),
-                                                Text(
-                                                  entry.value,
-                                                  style: const TextStyle(fontSize: 16),
-                                                ),
-                                              ],
-                                            ))
-                                        .toList(), // added .toList()
+                                  ),
+                                  Text(
+                                    '${msg.timestamp.hour.toString().padLeft(2, '0')}:${msg.timestamp.minute.toString().padLeft(2, '0')}:${msg.timestamp.second.toString().padLeft(2, '0')}',
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
                                   ),
                                 ],
-                              ],
-                            ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Language: ${msg.language == 'unknown' ? 'Unknown' : msg.language}',
+                                style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
+                              ),
+                            ],
                           ),
                         ),
-                      ),
-                    ),
-            ),
+                      );
+                    },
+                  ),
           ),
         ],
       ),
