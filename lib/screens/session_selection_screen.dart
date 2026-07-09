@@ -8,9 +8,9 @@ import '../route_observer.dart';
 // ========== SessionHistoryItem ==========
 class SessionHistoryItem {
   final String url;
-  String name;                // editable; default = formatted firstConnected
+  String name;
   final DateTime firstConnected;
-  DateTime lastConnected;     // used for sorting
+  DateTime lastConnected;
 
   SessionHistoryItem({
     required this.url,
@@ -38,7 +38,6 @@ class SessionHistoryItem {
   static SessionHistoryItem? tryParse(String stored) {
     try {
       final map = jsonDecode(stored) as Map<String, dynamic>;
-      // Legacy migration
       if (!map.containsKey('name') || !map.containsKey('firstConnected')) {
         final url = map['url'] as String;
         final last = map['lastConnected'] != null
@@ -91,6 +90,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   List<SessionHistoryItem> _history = [];
   bool _isLoading = true;
 
+  // Selection state – always active
+  final Set<int> _selectedIndices = {};
+
   @override
   void initState() {
     super.initState();
@@ -129,24 +131,28 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       if (item != null) items.add(item);
     }
 
-    // ✅ SORT BY LAST CONNECTED (most recent first)
+    // Sort by lastConnected (most recent first)
     items.sort((a, b) => b.lastConnected.compareTo(a.lastConnected));
 
     setState(() {
       _history = items;
       _isLoading = false;
+      // Reset selection when loading
+      _selectedIndices.clear();
     });
   }
 
   Future<void> _saveHistory(List<SessionHistoryItem> newList) async {
-    // Sort by lastConnected before saving, to keep order consistent
     newList.sort((a, b) => b.lastConnected.compareTo(a.lastConnected));
     final prefs = await SharedPreferences.getInstance();
     final jsonList = newList
         .map((item) => jsonEncode(item.toJson()))
         .toList();
     await prefs.setStringList('session_history', jsonList);
-    setState(() => _history = newList);
+    setState(() {
+      _history = newList;
+      _selectedIndices.clear();
+    });
   }
 
   // ---------- URL resolution ----------
@@ -208,7 +214,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     final index = _history.indexWhere((item) => item.url == shortUrl);
     List<SessionHistoryItem> newList;
     if (index != -1) {
-      // Update lastConnected, keep name and firstConnected
       final updated = SessionHistoryItem(
         url: shortUrl,
         name: _history[index].name,
@@ -218,7 +223,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       newList = List<SessionHistoryItem>.from(_history);
       newList[index] = updated;
     } else {
-      // New session: default name = formatted firstConnected date/time
       final defaultName = _formatDateForName(now);
       final newItem = SessionHistoryItem(
         url: shortUrl,
@@ -228,7 +232,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       );
       newList = List<SessionHistoryItem>.from(_history)..add(newItem);
     }
-    // Saving will re‑sort by lastConnected
     await _saveHistory(newList);
 
     if (mounted) {
@@ -242,7 +245,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
   }
 
-  // ---------- Edit name ----------
+  // ---------- Edit name (single) ----------
   Future<void> _editName(int index) async {
     final item = _history[index];
     final controller = TextEditingController(text: item.name);
@@ -276,24 +279,35 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       );
       final newList = List<SessionHistoryItem>.from(_history);
       newList[index] = updated;
-      // Saving will re‑sort by lastConnected
       await _saveHistory(newList);
     }
   }
 
-  // ---------- Delete / clear ----------
+  // ---------- Delete single ----------
   void _deleteSession(int index) {
     final newList = List<SessionHistoryItem>.from(_history);
     newList.removeAt(index);
     _saveHistory(newList);
   }
 
-  void _clearAllSessions() async {
+  // ---------- Selection actions ----------
+  void _toggleSelection(int index) {
+    setState(() {
+      if (_selectedIndices.contains(index)) {
+        _selectedIndices.remove(index);
+      } else {
+        _selectedIndices.add(index);
+      }
+    });
+  }
+
+  Future<void> _deleteSelected() async {
+    if (_selectedIndices.isEmpty) return;
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Clear all sessions?'),
-        content: const Text('This will remove all saved URLs and names.'),
+        title: const Text('Delete selected sessions?'),
+        content: Text('This will remove ${_selectedIndices.length} session(s).'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -301,17 +315,45 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Clear', style: TextStyle(color: Colors.red)),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
           ),
         ],
       ),
     );
-    if (confirm == true) {
-      await _saveHistory([]);
+    if (confirm != true) return;
+
+    // Remove selected indices (descending order to avoid shifting)
+    final sorted = _selectedIndices.toList()..sort((a, b) => b.compareTo(a));
+    final newList = List<SessionHistoryItem>.from(_history);
+    for (var idx in sorted) {
+      newList.removeAt(idx);
     }
+    await _saveHistory(newList); // also resets selection
   }
 
-  // ---------- Formatting for last‑connected display ----------
+  Future<void> _deleteAll() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete all sessions?'),
+        content: const Text('This will remove all saved sessions.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete All', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    await _saveHistory([]);
+  }
+
+  // ---------- Formatting for display ----------
   String _formatDateTime(DateTime dt) {
     final now = DateTime.now();
     final diff = now.difference(dt);
@@ -332,14 +374,28 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Select Session'),
+        title: _selectedIndices.isNotEmpty
+            ? Text('${_selectedIndices.length} selected')
+            : const Text('Select Session'),
         actions: [
-          if (_history.isNotEmpty)
+          if (_selectedIndices.isNotEmpty)
             IconButton(
-              icon: const Icon(Icons.delete_sweep),
-              onPressed: _clearAllSessions,
-              tooltip: 'Clear all',
+              icon: const Icon(Icons.delete),
+              onPressed: _deleteSelected,
+              tooltip: 'Delete selected',
             ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (value) {
+              if (value == 'delete_all') _deleteAll();
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem<String>(
+                value: 'delete_all',
+                child: Text('Delete All'),
+              ),
+            ],
+          ),
         ],
       ),
       body: _isLoading
@@ -350,10 +406,14 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                   itemCount: _history.length,
                   itemBuilder: (context, index) {
                     final item = _history[index];
+                    final isSelected = _selectedIndices.contains(index);
                     return ListTile(
-                      leading: const Icon(Icons.history),
+                      leading: Checkbox(
+                        value: isSelected,
+                        onChanged: (_) => _toggleSelection(index),
+                      ),
                       title: Text(
-                        item.name, // first line: editable name
+                        item.name,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w500),
                       ),
@@ -361,12 +421,12 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            item.url, // second line: URL
+                            item.url,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(fontSize: 12),
                           ),
                           Text(
-                            'Last connected: ${_formatDateTime(item.lastConnected)}', // third line
+                            'Last connected: ${_formatDateTime(item.lastConnected)}',
                             style: const TextStyle(fontSize: 12, color: Colors.grey),
                           ),
                         ],
