@@ -6,6 +6,32 @@ import 'dart:developer' as developer;
 import 'package:wakelock/wakelock.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../route_observer.dart';
+import 'dart:io';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+
+const List<String> _availableLanguages = [
+  'English',
+  'German',
+  'French',
+  'Spanish',
+  'Italian',
+  'Portuguese',
+  'Dutch',
+  'Polish',
+  'Russian',
+  'Japanese',
+  'Chinese',
+  'Arabic',
+  'Turkish',
+  'Korean',
+  'Hindi',
+  'Indonesian',
+  'Swedish',
+  'Norwegian',
+];
 
 // ========== SessionHistoryItem ==========
 class SessionHistoryItem {
@@ -423,6 +449,168 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   String _formatTime(DateTime dt) =>
       '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
+  Future<void> _showLanguageDialog(String sessionUrl) async {
+  // Extract session ID from URL
+  final sessionId = _extractSessionId(sessionUrl);
+  if (sessionId == null) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Could not extract session ID from URL'),
+        backgroundColor: Colors.red,
+      ),
+    );
+    return;
+  }
+
+  final selectedLanguage = await showDialog<String>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Select Language'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: ListView.builder(
+          shrinkWrap: true,
+          itemCount: _availableLanguages.length,
+          itemBuilder: (context, index) {
+            final lang = _availableLanguages[index];
+            return ListTile(
+              title: Text(lang),
+              onTap: () => Navigator.pop(context, lang),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+      ],
+    ),
+  );
+
+  if (selectedLanguage != null && mounted) {
+    await _fetchAndSharePdf(sessionId, selectedLanguage);
+  }
+}
+
+  String? _extractSessionId(String url) {
+    // Extract session ID from URL like:
+    // https://lecture-translator.kit.edu/webapi/stream?channel=71554268071439283655887716465600298323
+    // or from the short URL
+    final uri = Uri.parse(url);
+    final channel = uri.queryParameters['channel'];
+    if (channel != null && channel.isNotEmpty) {
+      return channel;
+    }
+    
+    // Try to extract from path as fallback
+    final segments = uri.pathSegments;
+    if (segments.isNotEmpty) {
+      final last = segments.last;
+      if (last.isNotEmpty) {
+        return last;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _fetchAndSharePdf(String sessionId, String language) async {
+    // Show loading indicator
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+
+    try {
+      // Fetch the cached text
+      final url = 'https://lecture-translator.kit.edu/get_cached_text/$sessionId?window=$language';
+      final response = await http.get(Uri.parse(url));
+      
+      if (response.statusCode != 200) {
+        throw Exception('Failed to fetch text: HTTP ${response.statusCode}');
+      }
+
+      final textContent = response.body;
+      
+      // Generate PDF
+      final pdfFile = await _generatePdf(textContent, language, sessionId);
+      
+      // Dismiss loading dialog
+      if (mounted) Navigator.pop(context);
+      
+      // Share the PDF
+      await _sharePdf(pdfFile, language);
+      
+    } catch (e) {
+      if (mounted) {
+        Navigator.pop(context); // Dismiss loading
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<File> _generatePdf(String text, String language, String sessionId) async {
+    final pdf = pw.Document();
+    
+    // Add content
+    pdf.addPage(
+      pw.Page(
+        build: (pw.Context context) {
+          return pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              pw.Text(
+                'Lecture Translation - $language',
+                style: pw.TextStyle(
+                  fontSize: 20,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              pw.Text(
+                'Session ID: $sessionId',
+                style: const pw.TextStyle(fontSize: 12, color: PdfColors.grey),
+              ),
+              pw.Text(
+                'Generated: ${DateTime.now().toLocal().toString()}',
+                style: const pw.TextStyle(fontSize: 12, color: PdfColors.grey),
+              ),
+              pw.Divider(),
+              pw.SizedBox(height: 10),
+              pw.Text(
+                text,
+                style: const pw.TextStyle(fontSize: 12),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    // Save to temporary directory
+    final directory = await getTemporaryDirectory();
+    final fileName = 'lecture_${sessionId.substring(0, 8)}_$language.pdf';
+    final file = File('${directory.path}/$fileName');
+    await file.writeAsBytes(await pdf.save());
+    
+    return file;
+  }
+
+  Future<void> _sharePdf(File pdfFile, String language) async {
+    await Share.shareXFiles(
+      [XFile(pdfFile.path)],
+      text: 'Lecture translation in $language',
+      subject: 'Lecture Translation PDF',
+    );
+  }
+  
   // ---------- Build ----------
   @override
   Widget build(BuildContext context) {
@@ -445,25 +633,48 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
               onPressed: _deleteSelected,
               tooltip: 'Delete selected',
             ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert),
-            onSelected: (value) {
-              if (value == 'delete_all') _deleteAll();
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem<String>(
-                value: 'delete_all',
-                child: Text('Delete All'),
-              ),
-            ],
-          ),
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: _showSettingsDialog,
             tooltip: 'Settings',
           ),
         ],
+      // ---------- Second row: only visible when items are selected ----------
+      bottom: _selectedIndices.isNotEmpty
+          ? PreferredSize(
+              preferredSize: const Size.fromHeight(48.0),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                alignment: Alignment.centerRight,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    // Trash icon – delete selected
+                    IconButton(
+                      icon: const Icon(Icons.delete),
+                      onPressed: _deleteSelected,
+                      tooltip: 'Delete selected',
+                    ),
+                    // Overflow menu – Delete All
+                    PopupMenuButton<String>(
+                      icon: const Icon(Icons.more_vert),
+                      onSelected: (value) {
+                        if (value == 'delete_all') _deleteAll();
+                      },
+                      itemBuilder: (context) => [
+                        const PopupMenuItem<String>(
+                          value: 'delete_all',
+                          child: Text('Delete All'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : null, // no second row when nothing selected
       ),
+     
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _history.isEmpty
@@ -500,6 +711,12 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
+                          // NEW: Share button
+                          IconButton(
+                            icon: const Icon(Icons.share, size: 20),
+                            onPressed: () => _showLanguageDialog(item.url),
+                            tooltip: 'Share as PDF',
+                          ),
                           IconButton(
                             icon: const Icon(Icons.edit, size: 20),
                             onPressed: () => _editName(index),

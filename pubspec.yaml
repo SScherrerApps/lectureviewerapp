@@ -19,7 +19,10 @@ dependencies:
   firebase_auth: ^6.5.4
   cloud_firestore: ^6.6.0
   flutter_tts: ^4.2.5
-  share_plus: ^7.0.0  
+  share_plus: ^7.2.1          # For sharing files
+  path_provider: ^2.1.0       # For getting temporary directory
+  pdf: ^3.10.4                # For generating PDFs
+  printing: ^5.11.1           # For PDF generation support
 
 dev_dependencies:
   flutter_test:
