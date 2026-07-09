@@ -155,7 +155,10 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
       Navigator.pushReplacementNamed(
         context,
         '/live',
-        arguments: resolvedUrl,
+        arguments: {
+          'resolvedUrl': resolvedUrl,
+          'originalUrl': rawInput,   // the short link the user scanned/entered
+        },
       );
     }
   }

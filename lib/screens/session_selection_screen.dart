@@ -1,37 +1,17 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'dart:developer' as developer;
 import 'package:wakelock/wakelock.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../route_observer.dart';
-import 'dart:io';
 import 'package:share_plus/share_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
-
-const List<String> _availableLanguages = [
-  'English',
-  'German',
-  'French',
-  'Spanish',
-  'Italian',
-  'Portuguese',
-  'Dutch',
-  'Polish',
-  'Russian',
-  'Japanese',
-  'Chinese',
-  'Arabic',
-  'Turkish',
-  'Korean',
-  'Hindi',
-  'Indonesian',
-  'Swedish',
-  'Norwegian',
-];
 
 // ========== SessionHistoryItem ==========
 class SessionHistoryItem {
@@ -302,7 +282,14 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
     if (mounted) {
       Navigator.pop(context);
-      Navigator.pushNamed(context, '/live', arguments: resolvedUrl);
+      Navigator.pushNamed(
+        context,
+        '/live',
+        arguments: {
+          'resolvedUrl': resolvedUrl,
+          'originalUrl': shortUrl,
+        },
+      );
     }
   }
 
@@ -449,73 +436,205 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   String _formatTime(DateTime dt) =>
       '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
+  // ---------- Dynamic language fetching for PDF sharing ----------
+  Future<Map<String, String>> _fetchLanguageNameToIndexMap(String sessionUrl) async {
+    try {
+      final response = await http.get(Uri.parse(sessionUrl));
+      if (response.statusCode != 200) return {};
+
+      final body = response.body;
+      final langIndexRegex = RegExp(r'data-lang-index="([^"]+)"');
+      final match = langIndexRegex.firstMatch(body);
+      if (match == null) return {};
+
+      final raw = match.group(1)!.replaceAll('&quot;', '"');
+      final Map<String, dynamic> map = jsonDecode(raw);
+      final result = <String, String>{};
+      for (final entry in map.entries) {
+        final name = entry.key;
+        if (!name.contains('Audio') && !name.contains('Correction')) {
+          result[name] = entry.value.toString();
+        }
+      }
+      return result;
+    } catch (e) {
+      developer.log('Failed to fetch language map: $e');
+      return {};
+    }
+  }
+
+  // Extract session ID from the short URL by fetching its HTML
+  Future<String?> _extractSessionIdFromUrl(String url) async {
+    try {
+      final uri = Uri.parse(url);
+      final channel = uri.queryParameters['channel'];
+      if (channel != null && channel.isNotEmpty) {
+        return channel;
+      }
+
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode != 200) return null;
+
+      final body = response.body;
+      final sessionIdRegex = RegExp(r'window\.sessionId\s*=\s*"([^"]+)"');
+      final match = sessionIdRegex.firstMatch(body);
+      return match?.group(1);
+    } catch (e) {
+      developer.log('Error extracting session ID: $e');
+      return null;
+    }
+  }
+
   Future<void> _showLanguageDialog(String sessionUrl) async {
-  // Extract session ID from URL
-  final sessionId = _extractSessionId(sessionUrl);
-  if (sessionId == null) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Could not extract session ID from URL'),
-        backgroundColor: Colors.red,
+    final sessionId = await _extractSessionIdFromUrl(sessionUrl);
+    if (!mounted) return;
+    if (sessionId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not extract session ID from URL.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
+
+    final langMap = await _fetchLanguageNameToIndexMap(sessionUrl);
+    if (!mounted) return;
+    Navigator.pop(context);
+
+    if (langMap.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No text languages available for this session.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    final names = langMap.keys.toList()..sort((a, b) {
+      if (a == 'Transcript') return -1;
+      if (b == 'Transcript') return 1;
+      return a.compareTo(b);
+    });
+
+    final selectedName = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Select Language'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: names.length,
+            itemBuilder: (context, index) {
+              final name = names[index];
+              return ListTile(
+                title: Text(name),
+                onTap: () => Navigator.pop(context, name),
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+        ],
       ),
     );
-    return;
-  }
 
-  final selectedLanguage = await showDialog<String>(
-    context: context,
-    builder: (context) => AlertDialog(
-      title: const Text('Select Language'),
-      content: SizedBox(
-        width: double.maxFinite,
-        child: ListView.builder(
-          shrinkWrap: true,
-          itemCount: _availableLanguages.length,
-          itemBuilder: (context, index) {
-            final lang = _availableLanguages[index];
-            return ListTile(
-              title: Text(lang),
-              onTap: () => Navigator.pop(context, lang),
-            );
-          },
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-      ],
-    ),
-  );
-
-  if (selectedLanguage != null && mounted) {
-    await _fetchAndSharePdf(sessionId, selectedLanguage);
-  }
-}
-
-  String? _extractSessionId(String url) {
-    // Extract session ID from URL like:
-    // https://lecture-translator.kit.edu/webapi/stream?channel=71554268071439283655887716465600298323
-    // or from the short URL
-    final uri = Uri.parse(url);
-    final channel = uri.queryParameters['channel'];
-    if (channel != null && channel.isNotEmpty) {
-      return channel;
-    }
-    
-    // Try to extract from path as fallback
-    final segments = uri.pathSegments;
-    if (segments.isNotEmpty) {
-      final last = segments.last;
-      if (last.isNotEmpty) {
-        return last;
+    if (selectedName != null && mounted) {
+      final index = langMap[selectedName];
+      if (index != null) {
+        await _fetchAndSharePdf(sessionId, index, selectedName);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Language index not found.'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
     }
-    return null;
   }
 
-  Future<void> _fetchAndSharePdf(String sessionId, String language) async {
+  // ---------- PDF generation with Unicode font ----------
+  Future<File> _generatePdf(String text, String languageName, String sessionId) async {
+    final pdf = pw.Document();
+
+    // Load a Unicode‑compatible font (e.g., NotoSans)
+    pw.Font? font;
+    try {
+      final data = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
+      font = pw.Font.ttf(data.buffer.asByteData());
+    } catch (e) {
+      // Fallback to built‑in (may not support all characters)
+      font = null;
+    }
+
+    pdf.addPage(
+      pw.Page(
+        build: (pw.Context context) {
+          return pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: [
+              pw.Text(
+                'Lecture Translation - $languageName',
+                style: pw.TextStyle(
+                  fontSize: 20,
+                  fontWeight: pw.FontWeight.bold,
+                  font: font,
+                ),
+              ),
+              pw.SizedBox(height: 10),
+              pw.Text(
+                'Session ID: $sessionId',
+                style: pw.TextStyle(
+                  fontSize: 12,
+                  color: PdfColors.grey,
+                  font: font,
+                ),
+              ),
+              pw.Text(
+                'Generated: ${DateTime.now().toLocal().toString()}',
+                style: pw.TextStyle(
+                  fontSize: 12,
+                  color: PdfColors.grey,
+                  font: font,
+                ),
+              ),
+              pw.Divider(),
+              pw.SizedBox(height: 10),
+              pw.Text(
+                text,
+                style: pw.TextStyle(
+                  fontSize: 12,
+                  font: font,
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    final directory = await getTemporaryDirectory();
+    final fileName = 'lecture_${sessionId.substring(0, 8)}_$languageName.pdf';
+    final file = File('${directory.path}/$fileName');
+    await file.writeAsBytes(await pdf.save());
+    return file;
+  }
+
+  // ---------- Share / Save action ----------
+  Future<void> _fetchAndSharePdf(String sessionId, String languageIndex, String languageName) async {
     // Show loading indicator
     showDialog(
       context: context,
@@ -524,93 +643,96 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     );
 
     try {
-      // Fetch the cached text
-      final url = 'https://lecture-translator.kit.edu/get_cached_text/$sessionId?window=$language';
+      final url = 'https://lecture-translator.kit.edu/get_cached_text/$sessionId?window=$languageIndex';
       final response = await http.get(Uri.parse(url));
-      
       if (response.statusCode != 200) {
         throw Exception('Failed to fetch text: HTTP ${response.statusCode}');
       }
 
       final textContent = response.body;
-      
-      // Generate PDF
-      final pdfFile = await _generatePdf(textContent, language, sessionId);
-      
-      // Dismiss loading dialog
-      if (mounted) Navigator.pop(context);
-      
-      // Share the PDF
-      await _sharePdf(pdfFile, language);
-      
+      final pdfFile = await _generatePdf(textContent, languageName, sessionId);
+
+      if (mounted) {
+        Navigator.pop(context); // dismiss loading
+
+        // Show action dialog: Share or Save
+        final action = await showDialog<String>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('PDF Ready'),
+            content: const Text('What would you like to do with the PDF?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'share'),
+                child: const Text('Share'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'save'),
+                child: const Text('Save to Device'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'cancel'),
+                child: const Text('Cancel'),
+              ),
+            ],
+          ),
+        );
+
+        if (action == 'share') {
+          await _sharePdf(pdfFile, languageName);
+        } else if (action == 'save') {
+          await _savePdfToDownloads(pdfFile, languageName);
+        }
+      }
     } catch (e) {
       if (mounted) {
-        Navigator.pop(context); // Dismiss loading
+        Navigator.pop(context);
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error: $e'),
-            backgroundColor: Colors.red,
-          ),
+          SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
         );
       }
     }
   }
 
-  Future<File> _generatePdf(String text, String language, String sessionId) async {
-    final pdf = pw.Document();
-    
-    // Add content
-    pdf.addPage(
-      pw.Page(
-        build: (pw.Context context) {
-          return pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
-              pw.Text(
-                'Lecture Translation - $language',
-                style: pw.TextStyle(
-                  fontSize: 20,
-                  fontWeight: pw.FontWeight.bold,
-                ),
-              ),
-              pw.SizedBox(height: 10),
-              pw.Text(
-                'Session ID: $sessionId',
-                style: const pw.TextStyle(fontSize: 12, color: PdfColors.grey),
-              ),
-              pw.Text(
-                'Generated: ${DateTime.now().toLocal().toString()}',
-                style: const pw.TextStyle(fontSize: 12, color: PdfColors.grey),
-              ),
-              pw.Divider(),
-              pw.SizedBox(height: 10),
-              pw.Text(
-                text,
-                style: const pw.TextStyle(fontSize: 12),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-
-    // Save to temporary directory
-    final directory = await getTemporaryDirectory();
-    final fileName = 'lecture_${sessionId.substring(0, 8)}_$language.pdf';
-    final file = File('${directory.path}/$fileName');
-    await file.writeAsBytes(await pdf.save());
-    
-    return file;
-  }
-
-  Future<void> _sharePdf(File pdfFile, String language) async {
+  Future<void> _sharePdf(File pdfFile, String languageName) async {
     await Share.shareXFiles(
       [XFile(pdfFile.path)],
-      text: 'Lecture translation in $language',
+      text: 'Lecture translation in $languageName',
       subject: 'Lecture Translation PDF',
     );
   }
-  
+
+  Future<void> _savePdfToDownloads(File pdfFile, String languageName) async {
+    try {
+      final downloadsDir = await getDownloadsDirectory();
+      final fileName = 'lecture_${DateTime.now().millisecondsSinceEpoch}_$languageName.pdf';
+
+      if (downloadsDir != null) {
+        await pdfFile.copy('${downloadsDir.path}/$fileName');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('PDF saved to Downloads folder')),
+          );
+        }
+      } else {
+        // Fallback: save to temporary directory
+        final tempDir = await getTemporaryDirectory();
+        await pdfFile.copy('${tempDir.path}/$fileName');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('PDF saved to ${tempDir.path}')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to save PDF: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
   // ---------- Build ----------
   @override
   Widget build(BuildContext context) {
@@ -639,42 +761,38 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
             tooltip: 'Settings',
           ),
         ],
-      // ---------- Second row: only visible when items are selected ----------
-      bottom: _selectedIndices.isNotEmpty
-          ? PreferredSize(
-              preferredSize: const Size.fromHeight(48.0),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                alignment: Alignment.centerRight,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    // Trash icon – delete selected
-                    IconButton(
-                      icon: const Icon(Icons.delete),
-                      onPressed: _deleteSelected,
-                      tooltip: 'Delete selected',
-                    ),
-                    // Overflow menu – Delete All
-                    PopupMenuButton<String>(
-                      icon: const Icon(Icons.more_vert),
-                      onSelected: (value) {
-                        if (value == 'delete_all') _deleteAll();
-                      },
-                      itemBuilder: (context) => [
-                        const PopupMenuItem<String>(
-                          value: 'delete_all',
-                          child: Text('Delete All'),
-                        ),
-                      ],
-                    ),
-                  ],
+        bottom: _selectedIndices.isNotEmpty
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(48.0),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                  alignment: Alignment.centerRight,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.delete),
+                        onPressed: _deleteSelected,
+                        tooltip: 'Delete selected',
+                      ),
+                      PopupMenuButton<String>(
+                        icon: const Icon(Icons.more_vert),
+                        onSelected: (value) {
+                          if (value == 'delete_all') _deleteAll();
+                        },
+                        itemBuilder: (context) => [
+                          const PopupMenuItem<String>(
+                            value: 'delete_all',
+                            child: Text('Delete All'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            )
-          : null, // no second row when nothing selected
+              )
+            : null,
       ),
-     
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _history.isEmpty
@@ -711,7 +829,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          // NEW: Share button
                           IconButton(
                             icon: const Icon(Icons.share, size: 20),
                             onPressed: () => _showLanguageDialog(item.url),
@@ -811,7 +928,6 @@ class _SettingsDialogState extends State<_SettingsDialog> {
           children: [
             const Text('Theme', style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
-            // SegmentedButton for theme selection
             SegmentedButton<String>(
               segments: const [
                 ButtonSegment(value: 'light', label: Text('Light')),

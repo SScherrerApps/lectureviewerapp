@@ -11,8 +11,14 @@ import 'package:http/http.dart' as http;
 import '../models/transcript_message.dart';
 
 class LiveTranscriptScreen extends StatefulWidget {
-  final String initialUrl;
-  const LiveTranscriptScreen({super.key, required this.initialUrl});
+  final String resolvedUrl;
+  final String? originalUrl; // the short HTML page URL (for fetching language mappings)
+
+  const LiveTranscriptScreen({
+    super.key,
+    required this.resolvedUrl,
+    this.originalUrl,
+  });
 
   @override
   State<LiveTranscriptScreen> createState() => _LiveTranscriptScreenState();
@@ -23,6 +29,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {}; // key -> message
   bool _defaultFilterSet = false;
+
+  // Dynamic sender -> language mapping (fetched from data-sender)
+  Map<String, String>? _senderToLanguage;
 
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
@@ -54,8 +63,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   void initState() {
     super.initState();
     if (kDebugMode) {
-      print('🔗 SSE URL: ${widget.initialUrl}');
-    }   // 👈 This will show in browser DevTools console
+      print('🔗 SSE URL: ${widget.resolvedUrl}');
+    }
     _initTts();
     _initFirebaseAndSession();
   }
@@ -75,9 +84,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       final currentUser = FirebaseAuth.instance.currentUser;
       if (currentUser != null) {
         final prefs = await SharedPreferences.getInstance();
-        _sessionId = prefs.getString('session_id_${widget.initialUrl}') ??
+        _sessionId = prefs.getString('session_id_${widget.resolvedUrl}') ??
             DateTime.now().millisecondsSinceEpoch.toString();
-        await prefs.setString('session_id_${widget.initialUrl}', _sessionId);
+        await prefs.setString('session_id_${widget.resolvedUrl}', _sessionId);
         _transcriptsRef = FirebaseFirestore.instance
             .collection('users')
             .doc(currentUser.uid)
@@ -94,7 +103,65 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       _sessionId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
     }
-    _connect(widget.initialUrl);
+
+    // Fetch dynamic language mapping from the session HTML before connecting
+    await _fetchLanguageMapping();
+
+    // Now connect with the resolved WebSocket/SSE URL
+    _connect(widget.resolvedUrl);
+  }
+
+  // ─── Fetch dynamic language mapping from the session page ──────────────
+  Future<void> _fetchLanguageMapping() async {
+    if (widget.originalUrl == null ||
+        !widget.originalUrl!.startsWith('http')) {
+      // No HTML page available, leave _senderToLanguage as null
+      return;
+    }
+
+    try {
+      final response = await http.get(Uri.parse(widget.originalUrl!));
+      if (response.statusCode != 200) {
+        return;
+      }
+
+      final body = response.body;
+
+      // ---- Extract data-sender ----
+      final senderRegex = RegExp(r'data-sender="([^"]+)"');
+      final senderMatch = senderRegex.firstMatch(body);
+      if (senderMatch != null) {
+        final raw = senderMatch.group(1)!.replaceAll('&quot;', '"');
+        final Map<String, dynamic> map = jsonDecode(raw);
+        _senderToLanguage = map.map((k, v) => MapEntry(k, v.toString()));
+      }
+
+      // ---- Extract data-lang-name (for dropdown pre-population) ----
+      final langNameRegex = RegExp(r'data-lang-name="([^"]+)"');
+      final langNameMatch = langNameRegex.firstMatch(body);
+      if (langNameMatch != null) {
+        final raw = langNameMatch.group(1)!.replaceAll('&quot;', '"');
+        final Map<String, dynamic> map = jsonDecode(raw);
+        // map is like {"1":"Transcript","2":"Arabic Audio",...}
+        for (final entry in map.entries) {
+          final name = entry.value.toString();
+          // Only add text languages (exclude Audio and Correction)
+          if (!name.contains('Audio') && !name.contains('Correction')) {
+            _availableLanguages.add(name);
+          }
+        }
+
+        // Set default filter if not already set
+        if (!_defaultFilterSet && _availableLanguages.isNotEmpty) {
+          _selectedLanguage = _availableLanguages.contains('Transcript')
+              ? 'Transcript'
+              : _availableLanguages.first;
+          _defaultFilterSet = true;
+        }
+      }
+    } catch (e) {
+      debugPrint('Could not fetch language mapping: $e');
+    }
   }
 
   // ─── Connection dispatcher ───────────────────────────────
@@ -104,7 +171,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnected = false;
       _isConnecting = true;
       _messagesMap.clear();
-      _availableLanguages.clear();
+      // Do NOT clear _availableLanguages here; we keep the pre‑populated list.
       _defaultFilterSet = false;
       _selectedLanguage = null;
     });
@@ -239,78 +306,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
-  // ─── Language extraction from sender (complete mapping) ────
+  // ─── Language extraction (dynamic only, no hardcoded fallback) ──────
   String _extractLanguageFromSender(String sender) {
-    // Full mapping from your HTML
-    const Map<String, String> senderToLanguage = {
-      // ASR / Transcript
-      'asr:speakerdiarization': 'Transcript',
-      'textstructurer:0_mult8': 'Transcript',
-      'summarizer:0_mult8': 'Transcript',
-      'postproduction:90_mult8': 'Transcript',
-      // Chinese
-      'mt:0': 'Chinese',
-      'textstructurer:0_zh': 'Chinese',
-      'summarizer:0_zh': 'Chinese',
-      'postproduction:90_zh': 'Chinese',
-      'tts:0': 'Chinese Audio',
-      // English
-      'mt:1': 'English',
-      'textstructurer:0_en': 'English',
-      'summarizer:0_en': 'English',
-      'postproduction:90_en': 'English',
-      'tts:1': 'English Audio',
-      // French
-      'mt:2': 'French',
-      'textstructurer:0_fr': 'French',
-      'summarizer:0_fr': 'French',
-      'postproduction:90_fr': 'French',
-      'tts:2': 'French Audio',
-      // German
-      'mt:3': 'German',
-      'textstructurer:0_de': 'German',
-      'summarizer:0_de': 'German',
-      'postproduction:90_de': 'German',
-      'tts:3': 'German Audio',
-      // Italian
-      'mt:4': 'Italian',
-      'textstructurer:0_it': 'Italian',
-      'summarizer:0_it': 'Italian',
-      'postproduction:90_it': 'Italian',
-      'tts:4': 'Italian Audio',
-      // Japanese
-      'mt:5': 'Japanese',
-      'textstructurer:0_ja': 'Japanese',
-      'summarizer:0_ja': 'Japanese',
-      'postproduction:90_ja': 'Japanese',
-      'tts:5': 'Japanese Audio',
-      // Persian
-      'mt:6': 'Persian',
-      'textstructurer:0_fa': 'Persian',
-      'summarizer:0_fa': 'Persian',
-      'postproduction:90_fa': 'Persian',
-      'tts:6': 'Persian Audio',
-      // Russian
-      'mt:7': 'Russian',
-      'textstructurer:0_ru': 'Russian',
-      'summarizer:0_ru': 'Russian',
-      'postproduction:90_ru': 'Russian',
-      'tts:7': 'Russian Audio',
-      // Spanish
-      'mt:8': 'Spanish',
-      'textstructurer:0_es': 'Spanish',
-      'summarizer:0_es': 'Spanish',
-      'postproduction:90_es': 'Spanish',
-      'tts:8': 'Spanish Audio',
-      // Vietnamese
-      'mt:9': 'Vietnamese',
-      'textstructurer:0_vi': 'Vietnamese',
-      'summarizer:0_vi': 'Vietnamese',
-      'postproduction:90_vi': 'Vietnamese',
-      'tts:9': 'Vietnamese Audio',
-    };
-
-    return senderToLanguage[sender] ?? sender;
+    if (_senderToLanguage != null && _senderToLanguage!.containsKey(sender)) {
+      return _senderToLanguage![sender]!;
+    }
+    // No mapping found – return the raw sender ID (which will be shown as language)
+    return sender;
   }
 
   // ─── Message handler ─────────────────────────────────────
@@ -326,10 +328,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     final sender = json['sender'] ?? '';
     final language = _extractLanguageFromSender(sender);
-    _availableLanguages.add(language);
 
-    // Set default filter to the first language (usually 'Transcript')
-    if (!_defaultFilterSet) {
+    // Only add text languages (not Audio, not Correction) to the dropdown
+    if (!language.contains('Audio') && !language.contains('Correction')) {
+      _availableLanguages.add(language);
+    }
+
+    // Set default filter to the first text language (usually 'Transcript')
+    if (!_defaultFilterSet && !language.contains('Audio') && !language.contains('Correction')) {
       _selectedLanguage = language;
       _defaultFilterSet = true;
     }
@@ -341,10 +347,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // Create a unique key for this message (sender + start + end)
     final key = '$sender|$start|$end';
 
-    // If there's already a message with this key, replace it (stable overwrites unstable)
+    // Replace logic: new stable overwrites unstable
     if (_messagesMap.containsKey(key)) {
       final existing = _messagesMap[key]!;
-      // If the new one is stable and the existing is unstable, replace
       if (!isUnstable && existing.isUnstable) {
         _messagesMap[key] = TranscriptMessage(
           transcript: transcriptText,
@@ -353,10 +358,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           language: language,
           isUnstable: isUnstable,
         );
-        // Also update Firestore if desired
-      }
-      // If both are stable, we could ignore or replace – we'll just replace
-      else {
+      } else {
+        // Replace anyway (both stable or both unstable)
         _messagesMap[key] = TranscriptMessage(
           transcript: transcriptText,
           translations: {},
@@ -377,7 +380,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _messagesMap[key] = message;
     }
 
-    // Save to Firestore (only stable messages, or all? – we'll save all for now)
+    // Save to Firestore
     if (_transcriptsRef != null) {
       try {
         await _transcriptsRef!.add({
@@ -397,11 +400,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = false;
     });
 
-    // TTS – speak only if stable and filter matches
+    // TTS – speak only if stable, filter matches, and not audio/Correction
     bool shouldSpeak = _ttsEnabled &&
         !isUnstable &&
         transcriptText.isNotEmpty &&
-        !transcriptText.startsWith('{');
+        !transcriptText.startsWith('{') &&
+        !language.contains('Audio') &&
+        !language.contains('Correction');
     if (shouldSpeak) {
       if (_selectedLanguage == null ||
           language.toLowerCase() == _selectedLanguage!.toLowerCase()) {
@@ -415,7 +420,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _sseSubscription = null;
-    _connect(widget.initialUrl);
+    _connect(widget.resolvedUrl);
   }
 
   Future<void> _toggleTts() async {
@@ -428,7 +433,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   Future<void> _scanNewQR() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('session_url');
-    await prefs.remove('session_id_${widget.initialUrl}');
+    await prefs.remove('session_id_${widget.resolvedUrl}');
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _sseSubscription = null;

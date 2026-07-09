@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform;
 import 'package:firebase_core/firebase_core.dart';
 import 'screens/qr_scanner_screen.dart';
 import 'screens/live_transcript_screen.dart';
-import 'route_observer.dart'; 
+import 'route_observer.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -41,7 +41,6 @@ void main() async {
       measurementId: "G-EJM5LW14VS",
     );
     await Firebase.initializeApp(options: firebaseOptions);
-    
   }
 
   runApp(const MyApp());
@@ -60,9 +59,28 @@ class MyApp extends StatelessWidget {
       routes: {
         '/': (context) => const SessionSelectionScreen(),
         '/scan': (context) => const QRScannerScreen(),
-        '/live': (context) => LiveTranscriptScreen(
-              initialUrl: ModalRoute.of(context)!.settings.arguments as String,
-            ),
+        '/live': (context) {
+          final args = ModalRoute.of(context)!.settings.arguments;
+          if (args is Map<String, dynamic>) {
+            return LiveTranscriptScreen(
+              resolvedUrl: args['resolvedUrl'] as String,
+              originalUrl: args['originalUrl'] as String?,
+            );
+          } else if (args is String) {
+            // Fallback for backward compatibility (if someone passes a plain String)
+            return LiveTranscriptScreen(
+              resolvedUrl: args,
+              originalUrl: null,
+            );
+          } else {
+            // Should never happen; show an error screen or redirect
+            return const Scaffold(
+              body: Center(
+                child: Text('Invalid navigation arguments'),
+              ),
+            );
+          }
+        },
       },
     );
   }
