@@ -303,6 +303,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
+  // ---------- Connect to session (stores sessionId and languageMap) ----------
   Future<void> _connectToSession(String shortUrl) async {
     showDialog(
       context: context,
@@ -312,10 +313,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
     String resolvedUrl;
     String sessionId;
-    Map<String, String>? langMap;
-
     try {
-      // If it's already a stream URL, extract channel directly
       if (shortUrl.contains('/stream?channel=')) {
         final uri = Uri.parse(shortUrl);
         final channel = uri.queryParameters['channel'];
@@ -324,50 +322,32 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         }
         resolvedUrl = shortUrl;
         sessionId = channel;
-        // Try to get stored language map for this URL if available
-        final existingIndex = _history.indexWhere((item) => item.url == shortUrl);
-        if (existingIndex != -1) {
-          langMap = _history[existingIndex].languageMap;
-        }
       } else {
-        // Resolve the URL – this fetches the page and extracts the sessionId
         final result = await _resolveUrl(shortUrl);
         resolvedUrl = result.resolvedUrl;
         sessionId = result.sessionId;
-        // Fetch language map (if available)
-        langMap = await _fetchLanguageNameToIndexMap(shortUrl);
-        if (langMap.isEmpty) langMap = null;
       }
     } catch (e) {
       if (mounted) {
         Navigator.pop(context);
-        // Show the error message (e.g., "Session already over")
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to connect: $e'), backgroundColor: Colors.red),
+          SnackBar(content: Text('Failed to resolve: $e'), backgroundColor: Colors.red),
         );
-      }
-      // If it's a session-over error, clear the stored sessionId from history
-      if (e.toString().contains('already ended') || e.toString().contains('expired')) {
-        final index = _history.indexWhere((item) => item.url == shortUrl);
-        if (index != -1) {
-          final existing = _history[index];
-          final updated = SessionHistoryItem(
-            url: existing.url,
-            name: existing.name,
-            firstConnected: existing.firstConnected,
-            lastConnected: existing.lastConnected,
-            sessionId: null,          // clear the stale ID
-            languageMap: existing.languageMap, // keep language map if any
-          );
-          final newList = List<SessionHistoryItem>.from(_history);
-          newList[index] = updated;
-          await _saveHistory(newList);
-        }
       }
       return;
     }
 
-    // Update history with the new (or confirmed) sessionId
+    // Fetch language map while the session is still resolvable
+    Map<String, String>? langMap;
+    try {
+      langMap = await _fetchLanguageNameToIndexMap(shortUrl);
+      if (langMap.isEmpty) {
+        langMap = null;
+      }
+    } catch (_) {
+      langMap = null;
+    }
+
     final now = DateTime.now();
     final index = _history.indexWhere((item) => item.url == shortUrl);
     List<SessionHistoryItem> newList;
@@ -379,8 +359,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         name: existing.name,
         firstConnected: existing.firstConnected,
         lastConnected: now,
-        sessionId: sessionId,
-        languageMap: langMap ?? existing.languageMap,
+        sessionId: existing.sessionId ?? sessionId,
+        languageMap: existing.languageMap ?? langMap,
       );
       newList = List<SessionHistoryItem>.from(_history);
       newList[index] = updated;
@@ -691,90 +671,52 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
-  /// Parses HTML into a list of PDF widgets, grouping text into paragraphs.
-  /// No unnecessary spacing – only a small gap between blocks.
+  /// Improved HTML parser that preserves inline spacing and punctuation
   List<pw.Widget> _parseHtmlToPdfWidgets(String html, pw.Font font) {
     final document = html_parser.parse(html);
     final body = document.body;
-    if (body == null) return [];
+    if (body == null) {
+      return [];
+    }
 
     final List<pw.Widget> widgets = [];
 
-    // Recursively collect text from a node
-    String collectText(dom.Node node) {
-      if (node is dom.Text) return node.text;
-      if (node is dom.Element) {
-        // For block elements, collect children but separate with newlines
-        switch (node.localName) {
-          case 'p':
-          case 'div':
-          case 'h1':
-          case 'h2':
-          case 'h3':
-            final sb = StringBuffer();
-            for (var child in node.children) {
-              sb.write(collectText(child));
-            }
-            return sb.toString();
-          case 'br':
-            return '\n';
-          default:
-            return node.text;
-        }
-      }
-      return '';
-    }
-
     void processNode(dom.Node node) {
-      if (node is dom.Element) {
+      if (node is dom.Text) {
+        final text = node.text;
+        if (text.trim().isNotEmpty) {
+          widgets.add(pw.Text(
+            text,
+            style: pw.TextStyle(fontSize: 12, font: font),
+          ));
+          widgets.add(pw.SizedBox(width: 4));
+        }
+      } else if (node is dom.Element) {
         switch (node.localName) {
-          case 'h1':
-          case 'h2':
-          case 'h3':
-            final text = collectText(node).trim();
-            if (text.isNotEmpty) {
-              final fontSize = node.localName == 'h1' ? 24.0 : (node.localName == 'h2' ? 18.0 : 16.0);
-              widgets.add(pw.Text(
-                text,
-                style: pw.TextStyle(
-                  fontSize: fontSize,
-                  fontWeight: pw.FontWeight.bold,
-                  font: font,
-                ),
-              ));
-              widgets.add(pw.SizedBox(height: 8.0));
-            }
+          case 'br':
+            widgets.add(pw.SizedBox(height: 6));
             break;
           case 'p':
           case 'div':
-            final text = collectText(node).trim();
-            if (text.isNotEmpty) {
-              widgets.add(pw.Text(
-                text,
-                style: pw.TextStyle(fontSize: 12.0, font: font),
-              ));
-              widgets.add(pw.SizedBox(height: 6.0));
+          case 'h1':
+          case 'h2':
+          case 'h3':
+            if (widgets.isNotEmpty) {
+              widgets.add(pw.SizedBox(height: 6));
             }
-            break;
-          case 'ul':
-          case 'ol':
-            for (var child in node.children) {
-              if (child.localName == 'li') { // no type check needed – children are Elements
-                final text = collectText(child).trim();
-                if (text.isNotEmpty) {
-                  final bullet = node.localName == 'ul' ? '• ' : '${widgets.length + 1}. ';
-                  widgets.add(pw.Text(
-                    '$bullet$text',
-                    style: pw.TextStyle(fontSize: 12.0, font: font),
-                  ));
-                  widgets.add(pw.SizedBox(height: 4.0));
-                }
-              }
+            for (var child in node.nodes) {
+              processNode(child);
             }
-            widgets.add(pw.SizedBox(height: 6.0));
+            widgets.add(pw.SizedBox(height: 6));
             break;
-          case 'br':
-            widgets.add(pw.SizedBox(height: 6.0));
+          case 'span':
+          case 'b':
+          case 'strong':
+          case 'i':
+          case 'em':
+            for (var child in node.nodes) {
+              processNode(child);
+            }
             break;
           default:
             for (var child in node.nodes) {
@@ -782,18 +724,25 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
             }
         }
       }
-      // Loose text nodes are handled by their parent elements
     }
 
     for (var child in body.nodes) {
       processNode(child);
     }
 
-    // Fallback: if no structured content, show plain text
+    // Remove the last extra SizedBox(width:4) if it exists
+    if (widgets.isNotEmpty && widgets.last is pw.SizedBox) {
+      final last = widgets.last as pw.SizedBox;
+      if (last.width == 4) {
+        widgets.removeLast();
+      }
+    }
+
+    // Fallback: if still empty, show plain text
     if (widgets.isEmpty) {
       final fullText = body.text.trim();
       if (fullText.isNotEmpty) {
-        widgets.add(pw.Text(fullText, style: pw.TextStyle(fontSize: 12.0, font: font)));
+        widgets.add(pw.Text(fullText, style: pw.TextStyle(fontSize: 12, font: font)));
       }
     }
 
