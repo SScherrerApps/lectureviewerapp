@@ -13,22 +13,25 @@ import 'package:share_plus/share_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
-import 'package:html/parser.dart' as html_parser;  // for parsing HTML
+import 'package:html/parser.dart' as html_parser;
 import 'package:html/dom.dart' as dom;
 
-
-// ========== SessionHistoryItem (unchanged) ==========
+// ========== SessionHistoryItem (with sessionId & languageMap) ==========
 class SessionHistoryItem {
   final String url;
   String name;
   final DateTime firstConnected;
   DateTime lastConnected;
+  final String? sessionId;
+  final Map<String, String>? languageMap;
 
   SessionHistoryItem({
     required this.url,
     required this.name,
     required this.firstConnected,
     required this.lastConnected,
+    this.sessionId,
+    this.languageMap,
   });
 
   Map<String, dynamic> toJson() => {
@@ -36,14 +39,26 @@ class SessionHistoryItem {
         'name': name,
         'firstConnected': firstConnected.toIso8601String(),
         'lastConnected': lastConnected.toIso8601String(),
+        'sessionId': sessionId,
+        'languageMap': languageMap != null ? jsonEncode(languageMap) : null,
       };
 
   factory SessionHistoryItem.fromJson(Map<String, dynamic> json) {
+    Map<String, String>? langMap;
+    final mapStr = json['languageMap'] as String?;
+    if (mapStr != null) {
+      try {
+        final decoded = jsonDecode(mapStr) as Map<String, dynamic>;
+        langMap = decoded.map((k, v) => MapEntry(k, v.toString()));
+      } catch (_) {}
+    }
     return SessionHistoryItem(
       url: json['url'] as String,
       name: json['name'] as String? ?? 'Session',
       firstConnected: DateTime.parse(json['firstConnected'] as String),
       lastConnected: DateTime.parse(json['lastConnected'] as String),
+      sessionId: json['sessionId'] as String?,
+      languageMap: langMap,
     );
   }
 
@@ -59,11 +74,22 @@ class SessionHistoryItem {
             ? DateTime.parse(map['firstConnected'] as String)
             : last;
         final name = _formatDateForName(first);
+        final sessionId = map['sessionId'] as String?;
+        Map<String, String>? langMap;
+        final mapStr = map['languageMap'] as String?;
+        if (mapStr != null) {
+          try {
+            final decoded = jsonDecode(mapStr) as Map<String, dynamic>;
+            langMap = decoded.map((k, v) => MapEntry(k, v.toString()));
+          } catch (_) {}
+        }
         return SessionHistoryItem(
           url: url,
           name: name,
           firstConnected: first,
           lastConnected: last,
+          sessionId: sessionId,
+          languageMap: langMap,
         );
       }
       return SessionHistoryItem.fromJson(map);
@@ -76,6 +102,8 @@ class SessionHistoryItem {
           name: _formatDateForName(now),
           firstConnected: now,
           lastConnected: now,
+          sessionId: null,
+          languageMap: null,
         );
       }
       return null;
@@ -175,7 +203,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     final List<SessionHistoryItem> items = [];
     for (final entry in storedList) {
       final item = SessionHistoryItem.tryParse(entry);
-      if (item != null) items.add(item);
+      if (item != null) {
+        items.add(item);
+      }
     }
     items.sort((a, b) => b.lastConnected.compareTo(a.lastConnected));
     setState(() {
@@ -196,63 +226,161 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     });
   }
 
-  // ---------- URL resolution ----------
-  Future<String> _resolveUrl(String input) async {
+  // ---------- URL resolution (returns both resolved URL and sessionId) ----------
+  Future<({String resolvedUrl, String sessionId})> _resolveUrl(String input) async {
     input = input.trim();
+
     if (input.startsWith('ws://') || input.startsWith('wss://')) {
-      return input;
+      final uri = Uri.parse(input);
+      final channel = uri.queryParameters['channel'];
+      if (channel == null || channel.isEmpty) {
+        throw Exception('Direct WebSocket URL missing channel.');
+      }
+      return (resolvedUrl: input, sessionId: channel);
     }
+
     if (!input.startsWith('http://') && !input.startsWith('https://')) {
       throw Exception('Invalid URL format.');
     }
+
     final response = await http.get(Uri.parse(input));
+    final body = response.body;
+
+    // Check for session‑over messages (even on HTTP 500)
+    final lowerBody = body.toLowerCase();
+    if (lowerBody.contains('session already over') ||
+        lowerBody.contains('session is over') ||
+        lowerBody.contains('session expired') ||
+        lowerBody.contains('this session is closed') ||
+        lowerBody.contains('no longer active')) {
+      throw Exception('This session has already ended. Please scan a new QR code.');
+    }
+
     if (response.statusCode != 200) {
       throw Exception('Server returned HTTP ${response.statusCode}');
     }
-    final body = response.body;
+
     final sessionIdRegex = RegExp(r'window\.sessionId\s*=\s*"([^"]+)"');
     final match = sessionIdRegex.firstMatch(body);
     if (match == null) {
-      throw Exception('Could not find window.sessionId in the page.');
+      throw Exception('Could not find a valid session. The session may have expired.');
     }
+
     final sessionId = match.group(1)!;
     developer.log('Resolved session ID: $sessionId');
+
     final uri = Uri.parse(input);
-    return '${uri.scheme}://${uri.host}/webapi/stream?channel=$sessionId';
+    final resolvedUrl = '${uri.scheme}://${uri.host}/webapi/stream?channel=$sessionId';
+    return (resolvedUrl: resolvedUrl, sessionId: sessionId);
   }
 
-  // ---------- Connect to session ----------
+  // ---------- Fetch language map (can be called even after session ends) ----------
+  Future<Map<String, String>> _fetchLanguageNameToIndexMap(String sessionUrl) async {
+    try {
+      final response = await http.get(Uri.parse(sessionUrl));
+      if (response.statusCode != 200) {
+        return {};
+      }
+      final body = response.body;
+      final langIndexRegex = RegExp(r'data-lang-index="([^"]+)"');
+      final match = langIndexRegex.firstMatch(body);
+      if (match == null) {
+        return {};
+      }
+      final raw = match.group(1)!.replaceAll('&quot;', '"');
+      final Map<String, dynamic> map = jsonDecode(raw);
+      final result = <String, String>{};
+      for (final entry in map.entries) {
+        final name = entry.key;
+        if (!name.contains('Audio') && !name.contains('Correction')) {
+          result[name] = entry.value.toString();
+        }
+      }
+      return result;
+    } catch (e) {
+      developer.log('Failed to fetch language map: $e');
+      return {};
+    }
+  }
+
   Future<void> _connectToSession(String shortUrl) async {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => const Center(child: CircularProgressIndicator()),
     );
+
     String resolvedUrl;
+    String sessionId;
+    Map<String, String>? langMap;
+
     try {
+      // If it's already a stream URL, extract channel directly
       if (shortUrl.contains('/stream?channel=')) {
+        final uri = Uri.parse(shortUrl);
+        final channel = uri.queryParameters['channel'];
+        if (channel == null || channel.isEmpty) {
+          throw Exception('Stream URL missing channel.');
+        }
         resolvedUrl = shortUrl;
+        sessionId = channel;
+        // Try to get stored language map for this URL if available
+        final existingIndex = _history.indexWhere((item) => item.url == shortUrl);
+        if (existingIndex != -1) {
+          langMap = _history[existingIndex].languageMap;
+        }
       } else {
-        resolvedUrl = await _resolveUrl(shortUrl);
+        // Resolve the URL – this fetches the page and extracts the sessionId
+        final result = await _resolveUrl(shortUrl);
+        resolvedUrl = result.resolvedUrl;
+        sessionId = result.sessionId;
+        // Fetch language map (if available)
+        langMap = await _fetchLanguageNameToIndexMap(shortUrl);
+        if (langMap.isEmpty) langMap = null;
       }
     } catch (e) {
       if (mounted) {
         Navigator.pop(context);
+        // Show the error message (e.g., "Session already over")
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to resolve: $e'), backgroundColor: Colors.red),
+          SnackBar(content: Text('Failed to connect: $e'), backgroundColor: Colors.red),
         );
+      }
+      // If it's a session-over error, clear the stored sessionId from history
+      if (e.toString().contains('already ended') || e.toString().contains('expired')) {
+        final index = _history.indexWhere((item) => item.url == shortUrl);
+        if (index != -1) {
+          final existing = _history[index];
+          final updated = SessionHistoryItem(
+            url: existing.url,
+            name: existing.name,
+            firstConnected: existing.firstConnected,
+            lastConnected: existing.lastConnected,
+            sessionId: null,          // clear the stale ID
+            languageMap: existing.languageMap, // keep language map if any
+          );
+          final newList = List<SessionHistoryItem>.from(_history);
+          newList[index] = updated;
+          await _saveHistory(newList);
+        }
       }
       return;
     }
+
+    // Update history with the new (or confirmed) sessionId
     final now = DateTime.now();
     final index = _history.indexWhere((item) => item.url == shortUrl);
     List<SessionHistoryItem> newList;
+
     if (index != -1) {
+      final existing = _history[index];
       final updated = SessionHistoryItem(
         url: shortUrl,
-        name: _history[index].name,
-        firstConnected: _history[index].firstConnected,
+        name: existing.name,
+        firstConnected: existing.firstConnected,
         lastConnected: now,
+        sessionId: sessionId,
+        languageMap: langMap ?? existing.languageMap,
       );
       newList = List<SessionHistoryItem>.from(_history);
       newList[index] = updated;
@@ -263,10 +391,14 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         name: defaultName,
         firstConnected: now,
         lastConnected: now,
+        sessionId: sessionId,
+        languageMap: langMap,
       );
       newList = List<SessionHistoryItem>.from(_history)..add(newItem);
     }
+
     await _saveHistory(newList);
+
     if (mounted) {
       Navigator.pop(context);
       Navigator.pushNamed(
@@ -313,6 +445,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         name: newName,
         firstConnected: item.firstConnected,
         lastConnected: item.lastConnected,
+        sessionId: item.sessionId,
+        languageMap: item.languageMap,
       );
       final newList = List<SessionHistoryItem>.from(_history);
       newList[index] = updated;
@@ -338,7 +472,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   }
 
   Future<void> _deleteSelected() async {
-    if (_selectedIndices.isEmpty) return;
+    if (_selectedIndices.isEmpty) {
+      return;
+    }
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -353,7 +489,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         ],
       ),
     );
-    if (confirm != true) return;
+    if (confirm != true) {
+      return;
+    }
     final sorted = _selectedIndices.toList()..sort((a, b) => b.compareTo(a));
     final newList = List<SessionHistoryItem>.from(_history);
     for (var idx in sorted) {
@@ -377,7 +515,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         ],
       ),
     );
-    if (confirm != true) return;
+    if (confirm != true) {
+      return;
+    }
     await _saveHistory([]);
   }
 
@@ -412,40 +552,31 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   String _formatTime(DateTime dt) =>
       '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
 
-  // ---------- Language map fetch ----------
-  Future<Map<String, String>> _fetchLanguageNameToIndexMap(String sessionUrl) async {
-    try {
-      final response = await http.get(Uri.parse(sessionUrl));
-      if (response.statusCode != 200) return {};
-      final body = response.body;
-      final langIndexRegex = RegExp(r'data-lang-index="([^"]+)"');
-      final match = langIndexRegex.firstMatch(body);
-      if (match == null) return {};
-      final raw = match.group(1)!.replaceAll('&quot;', '"');
-      final Map<String, dynamic> map = jsonDecode(raw);
-      final result = <String, String>{};
-      for (final entry in map.entries) {
-        final name = entry.key;
-        if (!name.contains('Audio') && !name.contains('Correction')) {
-          result[name] = entry.value.toString();
-        }
-      }
-      return result;
-    } catch (e) {
-      developer.log('Failed to fetch language map: $e');
-      return {};
-    }
-  }
-
+  // ---------- Extract session ID (uses stored ID first) ----------
   Future<String?> _extractSessionIdFromUrl(String url) async {
+    try {
+      final item = _history.firstWhere((item) => item.url == url);
+      if (item.sessionId != null && item.sessionId!.isNotEmpty) {
+        developer.log('Using stored sessionId: ${item.sessionId}');
+        return item.sessionId;
+      }
+    } catch (_) {}
+
+    // fallback: parse from URL
     try {
       final uri = Uri.parse(url);
       final channel = uri.queryParameters['channel'];
       if (channel != null && channel.isNotEmpty) {
         return channel;
       }
+    } catch (_) {}
+
+    // last resort: fetch (legacy)
+    try {
       final response = await http.get(Uri.parse(url));
-      if (response.statusCode != 200) return null;
+      if (response.statusCode != 200) {
+        return null;
+      }
       final body = response.body;
       final sessionIdRegex = RegExp(r'window\.sessionId\s*=\s*"([^"]+)"');
       final match = sessionIdRegex.firstMatch(body);
@@ -456,30 +587,31 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
+  // ---------- Share / PDF generation ----------
   Future<void> _showLanguageDialog(String sessionUrl) async {
-    final sessionId = await _extractSessionIdFromUrl(sessionUrl);
-    if (!mounted) return;
-    if (sessionId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Could not extract session ID from URL.'),
-          backgroundColor: Colors.red,
-        ),
-      );
+    // Try to get the stored language map from history first
+    Map<String, String>? langMap;
+    try {
+      final item = _history.firstWhere((item) => item.url == sessionUrl);
+      if (item.languageMap != null && item.languageMap!.isNotEmpty) {
+        langMap = item.languageMap;
+        developer.log('Using stored language map');
+      }
+    } catch (_) {}
+
+    // If not stored, try to fetch it (may fail for ended sessions)
+    if (langMap == null) {
+      langMap = await _fetchLanguageNameToIndexMap(sessionUrl);
+      if (langMap.isEmpty) {
+        langMap = null;
+      }
+    }
+
+    if (!mounted) {
       return;
     }
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(child: CircularProgressIndicator()),
-    );
-
-    final langMap = await _fetchLanguageNameToIndexMap(sessionUrl);
-    if (!mounted) return;
-    Navigator.pop(context);
-
-    if (langMap.isEmpty) {
+    if (langMap == null || langMap.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('No text languages available for this session.'),
@@ -489,9 +621,28 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       return;
     }
 
+    // We also need the sessionId – use stored or fallback
+    final sessionId = await _extractSessionIdFromUrl(sessionUrl);
+    if (!mounted) {
+      return;
+    }
+    if (sessionId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not extract session ID.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
     final names = langMap.keys.toList()..sort((a, b) {
-      if (a == 'Transcript') return -1;
-      if (b == 'Transcript') return 1;
+      if (a == 'Transcript') {
+        return -1;
+      }
+      if (b == 'Transcript') {
+        return 1;
+      }
       return a.compareTo(b);
     });
 
@@ -528,147 +679,96 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   }
 
   // ====================================================================
-  // NEW: PDF generation with HTML parsing and pagination
+  // PDF generation – with multi‑script font support & improved HTML parsing
   // ====================================================================
 
-  /// Load the Noto Sans font once, reused across pages.
   Future<pw.Font> _loadFont() async {
     try {
-      final fontData = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
-      if (kDebugMode) {
-        print('✅ NotoSans loaded successfully');
-      }
-      return pw.Font.ttf(fontData.buffer.asByteData());
-    } catch (e) {
-      if (kDebugMode) {
-        print('⚠️ Font load failed, using Helvetica: $e');
-      }
+      final data = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
+      return pw.Font.ttf(data.buffer.asByteData());
+    } catch (_) {
       return pw.Font.helvetica();
     }
   }
 
-  /// Convert HTML string to a list of PDF widgets.
+  /// Improved HTML parser that preserves inline spacing and punctuation
   List<pw.Widget> _parseHtmlToPdfWidgets(String html, pw.Font font) {
     final document = html_parser.parse(html);
     final body = document.body;
-    if (body == null) return [];
+    if (body == null) {
+      return [];
+    }
 
     final List<pw.Widget> widgets = [];
 
-    void addTextBlock(String text, {double fontSize = 12, bool bold = false, double spacing = 4}) {
-      final trimmed = text.trim();
-      if (trimmed.isNotEmpty) {
-        widgets.add(pw.Text(
-          trimmed,
-          style: pw.TextStyle(
-            fontSize: fontSize,
-            fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
-            font: font,
-          ),
-        ));
-        widgets.add(pw.SizedBox(height: spacing));
-      }
-    }
-
-    void addTextWithLineBreaks(String text, {double fontSize = 12, double spacing = 4}) {
-      final lines = text.split('\n');
-      for (var line in lines) {
-        final trimmed = line.trim();
-        if (trimmed.isNotEmpty) {
-          widgets.add(pw.Text(
-            trimmed,
-            style: pw.TextStyle(fontSize: fontSize, font: font),
-          ));
-          widgets.add(pw.SizedBox(height: spacing));
-        }
-      }
-    }
-
     void processNode(dom.Node node) {
-      if (kDebugMode) {
-        print('🔍 Processing node: ${node.runtimeType}, text: "${node.text}"');
-      }
-      if (node is dom.Element) {
-        if (kDebugMode) {
-          print('  📌 Element: ${node.localName}');
+      if (node is dom.Text) {
+        final text = node.text;
+        if (text.trim().isNotEmpty) {
+          widgets.add(pw.Text(
+            text,
+            style: pw.TextStyle(fontSize: 12, font: font),
+          ));
+          widgets.add(pw.SizedBox(width: 4));
         }
+      } else if (node is dom.Element) {
         switch (node.localName) {
-          case 'h1':
-            addTextBlock(node.text, fontSize: 24, bold: true, spacing: 8);
-            break;
-          case 'h2':
-            addTextBlock(node.text, fontSize: 18, bold: true, spacing: 6);
-            break;
-          case 'h3':
-            addTextBlock(node.text, fontSize: 16, bold: true, spacing: 4);
-            break;
-          case 'p':
-            addTextBlock(node.text, fontSize: 12, spacing: 6);
-            break;
           case 'br':
             widgets.add(pw.SizedBox(height: 6));
             break;
-          case 'ul':
-          case 'ol':
-            // For lists, we still want to iterate over children (li elements)
-            for (var child in node.children) {
-              if (child.localName == 'li') {
-                final bullet = node.localName == 'ul' ? '• ' : '${widgets.length + 1}. ';
-                addTextBlock('$bullet${child.text}', fontSize: 12, spacing: 4);
-              }
+          case 'p':
+          case 'div':
+          case 'h1':
+          case 'h2':
+          case 'h3':
+            if (widgets.isNotEmpty) {
+              widgets.add(pw.SizedBox(height: 6));
+            }
+            for (var child in node.nodes) {
+              processNode(child);
             }
             widgets.add(pw.SizedBox(height: 6));
             break;
-          case 'div':
-          case 'section':
-          case 'article':
-            // ✅ FIX: use .nodes to include text nodes inside these containers
+          case 'span':
+          case 'b':
+          case 'strong':
+          case 'i':
+          case 'em':
             for (var child in node.nodes) {
               processNode(child);
             }
             break;
           default:
-            // ✅ FIX: already uses .nodes (good)
             for (var child in node.nodes) {
               processNode(child);
             }
-            break;
-        }
-      } else if (node is dom.Text) {
-        if (kDebugMode) {
-          print('  📝 Text node: "${node.text}"');
-        }
-        final text = node.text;
-        if (text.trim().isNotEmpty) {
-          addTextWithLineBreaks(text, fontSize: 12, spacing: 4);
         }
       }
     }
 
-    // ✅ FIX: use body.nodes instead of body.children to include direct text nodes
     for (var child in body.nodes) {
       processNode(child);
     }
 
-    // Fallback (in case something still goes wrong)
-    if (widgets.isEmpty || widgets.every((w) => w is pw.SizedBox)) {
+    // Remove the last extra SizedBox(width:4) if it exists
+    if (widgets.isNotEmpty && widgets.last is pw.SizedBox) {
+      final last = widgets.last as pw.SizedBox;
+      if (last.width == 4) {
+        widgets.removeLast();
+      }
+    }
+
+    // Fallback: if still empty, show plain text
+    if (widgets.isEmpty) {
       final fullText = body.text.trim();
       if (fullText.isNotEmpty) {
-        final lines = fullText.split('\n');
-        for (var line in lines) {
-          final trimmed = line.trim();
-          if (trimmed.isNotEmpty) {
-            widgets.add(pw.Text(trimmed, style: pw.TextStyle(fontSize: 12, font: font)));
-            widgets.add(pw.SizedBox(height: 4));
-          }
-        }
+        widgets.add(pw.Text(fullText, style: pw.TextStyle(fontSize: 12, font: font)));
       }
     }
 
     return widgets;
   }
-  
-  /// Generate PDF from HTML with proper formatting and pagination.
+
   Future<File> _generatePdfFromHtml(String html, String languageName, String sessionId) async {
     final font = await _loadFont();
     final widgets = _parseHtmlToPdfWidgets(html, font);
@@ -679,8 +779,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
     final pdf = pw.Document();
 
-    // Add a cover/title page or include header on first page.
-    // We'll use MultiPage to add all widgets with a header.
     pdf.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
@@ -707,7 +805,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
             ],
           );
         },
-        // The body is the list of widgets (paragraphs, headings, etc.)
         build: (pw.Context context) => widgets,
       ),
     );
@@ -719,7 +816,6 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     return file;
   }
 
-  // ---------- Main fetch & share method ----------
   Future<void> _fetchAndSharePdf(String sessionId, String languageName) async {
     showDialog(
       context: context,
@@ -758,11 +854,10 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         print('📄 Raw HTML first 500 chars: ${htmlContent.substring(0, htmlContent.length > 500 ? 500 : htmlContent.length)}');
       }
 
-      // Generate PDF from HTML with formatting
       final pdfFile = await _generatePdfFromHtml(htmlContent, languageName, sessionId);
 
       if (mounted) {
-        Navigator.pop(context); // dismiss loading
+        Navigator.pop(context);
 
         final action = await showDialog<String>(
           context: context,
@@ -882,7 +977,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                       PopupMenuButton<String>(
                         icon: const Icon(Icons.more_vert),
                         onSelected: (value) {
-                          if (value == 'delete_all') _deleteAll();
+                          if (value == 'delete_all') {
+                            _deleteAll();
+                          }
                         },
                         itemBuilder: (context) => [
                           const PopupMenuItem<String>(
@@ -1001,9 +1098,13 @@ class _SettingsDialogState extends State<_SettingsDialog> {
   Future<void> _loadVersion() async {
     try {
       final info = await PackageInfo.fromPlatform();
-      if (mounted) setState(() => _appVersion = info.version);
+      if (mounted) {
+        setState(() => _appVersion = info.version);
+      }
     } catch (_) {
-      if (mounted) setState(() => _appVersion = 'unknown');
+      if (mounted) {
+        setState(() => _appVersion = 'unknown');
+      }
     }
   }
 
@@ -1054,6 +1155,8 @@ class _SettingsDialogState extends State<_SettingsDialog> {
 
   Future<void> _save() async {
     await widget.onSave(_tempTheme, _tempKeepOn);
-    if (mounted) Navigator.pop(context);
+    if (mounted) {
+      Navigator.pop(context);
+    }
   }
 }

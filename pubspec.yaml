@@ -22,7 +22,7 @@ dependencies:
   share_plus: ^7.2.1          # For sharing files
   path_provider: ^2.1.0       # For getting temporary directory 
   html: ^0.15.4     # for parsing HTML
-  pdf: ^3.10.4
+  pdf: ^3.12.0
   printing: ^5.11.1           # For PDF generation support
 
 dev_dependencies:
@@ -34,3 +34,8 @@ flutter:
   uses-material-design: true
   assets:
     - assets/fonts/NotoSans-Regular.ttf
+    - assets/fonts/NotoSansSC-Regular.ttf      # Simplified Chinese
+    - assets/fonts/NotoSansTC-Regular.ttf      # Traditional Chinese
+    - assets/fonts/NotoSansJP-Regular.ttf      # Japanese
+    - assets/fonts/NotoSansKR-Regular.ttf      # Korean
+    - assets/fonts/NotoSansArabic-Regular.ttf  # Arabic / Persian
