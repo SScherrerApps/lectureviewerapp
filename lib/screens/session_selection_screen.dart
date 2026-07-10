@@ -691,52 +691,90 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
-  /// Improved HTML parser that preserves inline spacing and punctuation
+  /// Parses HTML into a list of PDF widgets, grouping text into paragraphs.
+  /// No unnecessary spacing – only a small gap between blocks.
   List<pw.Widget> _parseHtmlToPdfWidgets(String html, pw.Font font) {
     final document = html_parser.parse(html);
     final body = document.body;
-    if (body == null) {
-      return [];
-    }
+    if (body == null) return [];
 
     final List<pw.Widget> widgets = [];
 
-    void processNode(dom.Node node) {
-      if (node is dom.Text) {
-        final text = node.text;
-        if (text.trim().isNotEmpty) {
-          widgets.add(pw.Text(
-            text,
-            style: pw.TextStyle(fontSize: 12, font: font),
-          ));
-          widgets.add(pw.SizedBox(width: 4));
-        }
-      } else if (node is dom.Element) {
+    // Recursively collect text from a node
+    String collectText(dom.Node node) {
+      if (node is dom.Text) return node.text;
+      if (node is dom.Element) {
+        // For block elements, collect children but separate with newlines
         switch (node.localName) {
-          case 'br':
-            widgets.add(pw.SizedBox(height: 6));
-            break;
           case 'p':
           case 'div':
           case 'h1':
           case 'h2':
           case 'h3':
-            if (widgets.isNotEmpty) {
-              widgets.add(pw.SizedBox(height: 6));
+            final sb = StringBuffer();
+            for (var child in node.children) {
+              sb.write(collectText(child));
             }
-            for (var child in node.nodes) {
-              processNode(child);
+            return sb.toString();
+          case 'br':
+            return '\n';
+          default:
+            return node.text;
+        }
+      }
+      return '';
+    }
+
+    void processNode(dom.Node node) {
+      if (node is dom.Element) {
+        switch (node.localName) {
+          case 'h1':
+          case 'h2':
+          case 'h3':
+            final text = collectText(node).trim();
+            if (text.isNotEmpty) {
+              final fontSize = node.localName == 'h1' ? 24.0 : (node.localName == 'h2' ? 18.0 : 16.0);
+              widgets.add(pw.Text(
+                text,
+                style: pw.TextStyle(
+                  fontSize: fontSize,
+                  fontWeight: pw.FontWeight.bold,
+                  font: font,
+                ),
+              ));
+              widgets.add(pw.SizedBox(height: 8.0));
             }
-            widgets.add(pw.SizedBox(height: 6));
             break;
-          case 'span':
-          case 'b':
-          case 'strong':
-          case 'i':
-          case 'em':
-            for (var child in node.nodes) {
-              processNode(child);
+          case 'p':
+          case 'div':
+            final text = collectText(node).trim();
+            if (text.isNotEmpty) {
+              widgets.add(pw.Text(
+                text,
+                style: pw.TextStyle(fontSize: 12.0, font: font),
+              ));
+              widgets.add(pw.SizedBox(height: 6.0));
             }
+            break;
+          case 'ul':
+          case 'ol':
+            for (var child in node.children) {
+              if (child.localName == 'li') { // no type check needed – children are Elements
+                final text = collectText(child).trim();
+                if (text.isNotEmpty) {
+                  final bullet = node.localName == 'ul' ? '• ' : '${widgets.length + 1}. ';
+                  widgets.add(pw.Text(
+                    '$bullet$text',
+                    style: pw.TextStyle(fontSize: 12.0, font: font),
+                  ));
+                  widgets.add(pw.SizedBox(height: 4.0));
+                }
+              }
+            }
+            widgets.add(pw.SizedBox(height: 6.0));
+            break;
+          case 'br':
+            widgets.add(pw.SizedBox(height: 6.0));
             break;
           default:
             for (var child in node.nodes) {
@@ -744,25 +782,18 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
             }
         }
       }
+      // Loose text nodes are handled by their parent elements
     }
 
     for (var child in body.nodes) {
       processNode(child);
     }
 
-    // Remove the last extra SizedBox(width:4) if it exists
-    if (widgets.isNotEmpty && widgets.last is pw.SizedBox) {
-      final last = widgets.last as pw.SizedBox;
-      if (last.width == 4) {
-        widgets.removeLast();
-      }
-    }
-
-    // Fallback: if still empty, show plain text
+    // Fallback: if no structured content, show plain text
     if (widgets.isEmpty) {
       final fullText = body.text.trim();
       if (fullText.isNotEmpty) {
-        widgets.add(pw.Text(fullText, style: pw.TextStyle(fontSize: 12, font: font)));
+        widgets.add(pw.Text(fullText, style: pw.TextStyle(fontSize: 12.0, font: font)));
       }
     }
 
