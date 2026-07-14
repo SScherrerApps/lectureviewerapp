@@ -44,6 +44,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
 
+  // Scroll controller for auto‑scroll
+  final ScrollController _scrollController = ScrollController();
+
   bool get _isDesktop {
     if (kIsWeb) return false;
     switch (defaultTargetPlatform) {
@@ -64,20 +67,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
     _initTts();
     _initFirebaseAndSession();
-  }
-
-  final ScrollController _scrollController = ScrollController();
-
-  void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      }
-    });
   }
 
   Future<void> _initTts() async {
@@ -314,6 +303,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     return raw.replaceAll(RegExp(r'<[^>]*>'), ' ');
   }
 
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
   Future<void> _handleMessage(Map<String, dynamic> json) async {
     debugPrint('📩 JSON keys: ${json.keys}');
     debugPrint('🔍 sender: "${json['sender']}"');
@@ -341,7 +342,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final isUnstable = json['unstable'] == true;
     final start = json['start']?.toString() ?? '';
 
-    // Use only sender + start for stable/unstable replacement
     String key;
     if (start.isNotEmpty) {
       key = '$sender|$start';
@@ -352,7 +352,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       key = '$sender|$textPrefix';
     }
 
-    // Replace existing message if key exists (stable overwrites unstable)
     _messagesMap[key] = TranscriptMessage(
       transcript: transcriptText,
       translations: {},
@@ -379,7 +378,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnected = true;
       _isConnecting = false;
     });
-    _scrollToBottom(); 
+    _scrollToBottom();
 
     bool shouldSpeak = _ttsEnabled &&
         !isUnstable &&
@@ -428,6 +427,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _sseSubscription?.cancel();
     _sseSubscription = null;
     _flutterTts.stop();
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -444,6 +444,25 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           .where((msg) =>
               msg.language.toLowerCase() == _selectedLanguage!.toLowerCase())
           .toList();
+    }
+
+    // Build continuous text with RichText (grey for unstable)
+    List<TextSpan> spans = [];
+    for (int i = 0; i < filteredMessages.length; i++) {
+      final msg = filteredMessages[i];
+      spans.add(
+        TextSpan(
+          text: msg.transcript,
+          style: TextStyle(
+            fontSize: 18,
+            color: msg.isUnstable ? Colors.grey : Colors.black,
+          ),
+        ),
+      );
+      // Add a space between messages (except after the last)
+      if (i < filteredMessages.length - 1) {
+        spans.add(const TextSpan(text: ' '));
+      }
     }
 
     return Scaffold(
@@ -486,7 +505,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       ),
       body: Column(
         children: [
-          // Status bar (unchanged)
+          // Status bar
           Container(
             padding: const EdgeInsets.all(8),
             color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
@@ -532,7 +551,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               ],
             ),
           ),
-          // ─── Single Card with ListView (auto‑scroll to bottom) ──────────
+          // Single card with smooth continuous text
           Expanded(
             child: filteredMessages.isEmpty
                 ? Center(
@@ -543,53 +562,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                     ),
                   )
                 : Card(
-                    margin: const EdgeInsets.all(8),
+                    margin: const EdgeInsets.all(12),
                     elevation: 2,
-                    child: ListView.builder(
+                    child: SingleChildScrollView(
                       controller: _scrollController,
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      itemCount: filteredMessages.length,
-                      itemBuilder: (context, index) {
-                        final msg = filteredMessages[index];
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      msg.transcript,
-                                      style: TextStyle(
-                                        fontSize: 18,
-                                        color: msg.isUnstable ? Colors.grey : Colors.black,
-                                      ),
-                                    ),
-                                  ),
-                                  Text(
-                                    '${msg.timestamp.hour.toString().padLeft(2, '0')}:${msg.timestamp.minute.toString().padLeft(2, '0')}:${msg.timestamp.second.toString().padLeft(2, '0')}',
-                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                'Language: ${msg.language}',
-                                style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
-                              ),
-                              if (msg.isUnstable)
-                                const Text(
-                                  '(unstable)',
-                                  style: TextStyle(fontSize: 10, color: Colors.grey),
-                                ),
-                              // Divider except for the last item
-                              if (index < filteredMessages.length - 1)
-                                const Divider(height: 16, thickness: 1),
-                            ],
-                          ),
-                        );
-                      },
+                      padding: const EdgeInsets.all(16),
+                      child: SelectableText.rich(
+                        TextSpan(children: spans),
+                        style: const TextStyle(fontSize: 18),
+                      ),
                     ),
                   ),
           ),
