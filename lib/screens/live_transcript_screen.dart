@@ -66,6 +66,20 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _initFirebaseAndSession();
   }
 
+  final ScrollController _scrollController = ScrollController();
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
   Future<void> _initTts() async {
     await _flutterTts.setLanguage("en-US");
     await _flutterTts.setSpeechRate(0.5);
@@ -365,6 +379,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnected = true;
       _isConnecting = false;
     });
+    _scrollToBottom(); 
 
     bool shouldSpeak = _ttsEnabled &&
         !isUnstable &&
@@ -471,6 +486,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       ),
       body: Column(
         children: [
+          // Status bar (unchanged)
           Container(
             padding: const EdgeInsets.all(8),
             color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
@@ -516,6 +532,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               ],
             ),
           ),
+          // ─── Single Card with ListView (auto‑scroll to bottom) ──────────
           Expanded(
             child: filteredMessages.isEmpty
                 ? Center(
@@ -525,16 +542,17 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           : 'No messages in $_selectedLanguage',
                     ),
                   )
-                : ListView.builder(
-                    padding: const EdgeInsets.all(12),
-                    itemCount: filteredMessages.length,
-                    itemBuilder: (context, index) {
-                      final msg = filteredMessages[index];
-                      return Card(
-                        elevation: 2,
-                        margin: const EdgeInsets.symmetric(vertical: 4),
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
+                : Card(
+                    margin: const EdgeInsets.all(8),
+                    elevation: 2,
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      itemCount: filteredMessages.length,
+                      itemBuilder: (context, index) {
+                        final msg = filteredMessages[index];
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -565,11 +583,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                                   '(unstable)',
                                   style: TextStyle(fontSize: 10, color: Colors.grey),
                                 ),
+                              // Divider except for the last item
+                              if (index < filteredMessages.length - 1)
+                                const Divider(height: 16, thickness: 1),
                             ],
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
+                    ),
                   ),
           ),
         ],
