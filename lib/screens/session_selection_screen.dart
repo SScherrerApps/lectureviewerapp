@@ -710,6 +710,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     if (body == null) return [];
 
     final List<pw.Widget> widgets = [];
+    bool isFirst = true;
 
     void processNode(dom.Node node) {
       if (node is dom.Text) {
@@ -720,15 +721,42 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
             style: pw.TextStyle(
               fontSize: 12,
               font: primaryFont,
-              fontFallback: fallbackFonts, // 👈 added
+              fontFallback: fallbackFonts,
             ),
           ));
-          widgets.add(pw.SizedBox(width: 4));
         }
       } else if (node is dom.Element) {
-        // ... keep the same switch cases ...
-        // For each case, when you process children recursively, it's fine.
-        // The fallback will be applied to all nested text nodes.
+        switch (node.localName) {
+          case 'br':
+            widgets.add(pw.SizedBox(height: 4));
+            break;
+          case 'p':
+          case 'div':
+          case 'h1':
+          case 'h2':
+          case 'h3':
+            if (!isFirst) {
+              widgets.add(pw.SizedBox(height: 4));
+            }
+            isFirst = false;
+            for (var child in node.nodes) {
+              processNode(child);
+            }
+            break;
+          case 'span':
+          case 'b':
+          case 'strong':
+          case 'i':
+          case 'em':
+            for (var child in node.nodes) {
+              processNode(child);
+            }
+            break;
+          default:
+            for (var child in node.nodes) {
+              processNode(child);
+            }
+        }
       }
     }
 
@@ -736,15 +764,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       processNode(child);
     }
 
-    // Remove the last extra SizedBox(width:4) if it exists
-    if (widgets.isNotEmpty && widgets.last is pw.SizedBox) {
-      final last = widgets.last as pw.SizedBox;
-      if (last.width == 4) {
-        widgets.removeLast();
-      }
-    }
-
-    // Also update the fallback plain‑text widget:
+    // Fallback plain text
     if (widgets.isEmpty) {
       final fullText = body.text.trim();
       if (fullText.isNotEmpty) {
@@ -758,7 +778,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         ));
       }
     }
-      return widgets;
+
+    return widgets;
   }
 
   Future<File> _generatePdfFromHtml(String html, String languageName, String sessionId) async {
@@ -777,7 +798,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     pdf.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(36),
+        margin: const pw.EdgeInsets.all(28),
         header: (ctx) => pw.Column(
           children: [
             pw.Text(
