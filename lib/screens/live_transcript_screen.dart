@@ -42,15 +42,19 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
 
-  // Scroll controller for auto‑scroll
   final ScrollController _scrollController = ScrollController();
 
-  // Audio player and playback state
   final AudioPlayer _audioPlayer = AudioPlayer();
-  String? _playingKey;               // key of the message currently playing
+  String? _playingKey;
   bool _isAudioPlaying = false;
-  final Map<String, double> _progressMap = {};   // key → progress (0.0–1.0)
-  final Map<String, Duration> _durationMap = {}; // key → total duration
+  final Map<String, double> _progressMap = {};
+  final Map<String, Duration> _durationMap = {};
+
+  final http.Client _httpClient = http.Client();
+
+  // Store session ID from SSE events
+  String? _sseSessionId;
+  String? _baseUrl;
 
   bool get _isDesktop {
     if (kIsWeb) return false;
@@ -70,12 +74,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (kDebugMode) {
       print('🔗 SSE URL: ${widget.resolvedUrl}');
     }
+    _baseUrl = widget.originalUrl != null
+        ? Uri.parse(widget.originalUrl!).origin
+        : Uri.parse(widget.resolvedUrl).origin;
+    debugPrint('🏠 Base URL: $_baseUrl');
+
     _initFirebaseAndSession();
     _setupAudioListeners();
   }
 
   void _setupAudioListeners() {
     _audioPlayer.onPositionChanged.listen((Duration position) {
+      if (!mounted) return;
       if (_playingKey != null) {
         final duration = _durationMap[_playingKey];
         if (duration != null && duration.inMilliseconds > 0) {
@@ -87,6 +97,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
 
     _audioPlayer.onDurationChanged.listen((Duration duration) {
+      if (!mounted) return;
       if (_playingKey != null) {
         setState(() {
           _durationMap[_playingKey!] = duration;
@@ -95,6 +106,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
 
     _audioPlayer.onPlayerComplete.listen((_) {
+      if (!mounted) return;
       setState(() {
         if (_playingKey != null) {
           _progressMap[_playingKey!] = 1.0;
@@ -104,9 +116,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       });
     });
 
-    // audioplayers no longer exposes onPlayerError in newer versions.
-    // Use onPlayerStateChanged to track playing state and handle failures if needed.
     _audioPlayer.onPlayerStateChanged.listen((PlayerState state) {
+      if (!mounted) return;
       setState(() {
         _isAudioPlaying = state == PlayerState.playing;
         if (state == PlayerState.completed || state == PlayerState.stopped) {
@@ -140,7 +151,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         debugPrint('⚠️ Firebase not configured on desktop. Continuing without it.');
       } else {
         debugPrint('Firebase error: $e');
-        setState(() => _errorMessage = 'Firebase error: $e (will still try to connect)');
+        if (mounted) setState(() => _errorMessage = 'Firebase error: $e (will still try to connect)');
       }
       _sessionId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
     }
@@ -150,16 +161,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   Future<void> _fetchLanguageMapping() async {
-    if (widget.originalUrl == null ||
-        !widget.originalUrl!.startsWith('http')) {
-      return;
-    }
+    if (widget.originalUrl == null || !widget.originalUrl!.startsWith('http')) return;
 
     try {
-      final response = await http.get(Uri.parse(widget.originalUrl!));
-      if (response.statusCode != 200) {
-        return;
-      }
+      final response = await _httpClient.get(
+        Uri.parse(widget.originalUrl!),
+        headers: _browserHeaders(),
+      );
+      if (response.statusCode != 200) return;
 
       final body = response.body;
 
@@ -184,10 +193,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         }
 
         if (!_defaultFilterSet && _availableLanguages.isNotEmpty) {
-          _selectedLanguage = _availableLanguages.contains('Transcript')
-              ? 'Transcript'
-              : _availableLanguages.first;
-          _defaultFilterSet = true;
+          if (mounted) {
+            setState(() {
+              _selectedLanguage = _availableLanguages.contains('Transcript')
+                  ? 'Transcript'
+                  : _availableLanguages.first;
+              _defaultFilterSet = true;
+            });
+          }
         }
       }
     } catch (e) {
@@ -195,7 +208,19 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
+  Map<String, String> _browserHeaders() {
+    return {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+    };
+  }
+
   void _connect(String url) {
+    if (!mounted) return;
     setState(() {
       _errorMessage = null;
       _isConnected = false;
@@ -207,6 +232,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isAudioPlaying = false;
       _progressMap.clear();
       _durationMap.clear();
+      _sseSessionId = null;
     });
 
     if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -216,6 +242,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
+  void _reconnect() {
+    _channel?.sink.close();
+    _sseSubscription?.cancel();
+    _sseSubscription = null;
+    _connect(widget.resolvedUrl);
+  }
+
   void _connectSSE(String url) {
     debugPrint('🔗 Connecting to SSE: $url');
 
@@ -223,16 +256,20 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       'Accept': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
+      ..._browserHeaders(),
     };
+    if (widget.originalUrl != null) {
+      headers['Referer'] = widget.originalUrl!;
+      headers['Origin'] = _baseUrl!;
+    }
 
-    http.Client().send(http.Request('GET', Uri.parse(url))
-      ..headers.addAll(headers)
-    ).then((response) {
+    _httpClient.send(http.Request('GET', Uri.parse(url))..headers.addAll(headers))
+        .then((response) {
       if (response.statusCode != 200) {
         throw Exception('Server returned HTTP ${response.statusCode}');
       }
-      final stream = response.stream.transform(utf8.decoder);
 
+      final stream = response.stream.transform(utf8.decoder);
       String buffer = '';
       StreamSubscription<String> subscription;
       subscription = stream.listen((String chunk) {
@@ -246,6 +283,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         }
       }, onError: (error) {
         debugPrint('❌ SSE stream error: $error');
+        if (!mounted) return;
         setState(() {
           _errorMessage = 'SSE error: $error';
           _isConnected = false;
@@ -253,19 +291,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         });
       }, onDone: () {
         debugPrint('🔌 SSE disconnected');
+        if (!mounted) return;
         setState(() {
           _isConnected = false;
           _isConnecting = false;
         });
       });
       _sseSubscription = subscription;
-
+      if (!mounted) return;
       setState(() {
         _isConnected = true;
         _isConnecting = false;
       });
     }).catchError((error) {
       debugPrint('❌ Failed to connect SSE: $error');
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to connect: $error';
         _isConnected = false;
@@ -298,14 +338,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   void _connectWebSocket(String url) {
     debugPrint('🔗 Connecting to WebSocket: $url');
-
     try {
       _channel = WebSocketChannel.connect(Uri.parse(url));
       _channel!.stream.listen(
         (data) async {
           try {
             final Map<String, dynamic> json =
-                data is String ? jsonDecode(data) : data as Map<String, dynamic>;
+            data is String ? jsonDecode(data) : data as Map<String, dynamic>;
             await _handleMessage(json);
           } catch (e) {
             debugPrint('⚠️ WebSocket parse error: $e');
@@ -313,6 +352,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         },
         onError: (error) {
           debugPrint('❌ WebSocket error: $error');
+          if (!mounted) return;
           setState(() {
             _errorMessage = 'WebSocket error: $error';
             _isConnected = false;
@@ -321,6 +361,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         },
         onDone: () {
           debugPrint('🔌 WebSocket disconnected');
+          if (!mounted) return;
           setState(() {
             _isConnected = false;
             _isConnecting = false;
@@ -329,6 +370,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       );
     } catch (e) {
       debugPrint('❌ Failed to connect WebSocket: $e');
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to connect: $e';
         _isConnected = false;
@@ -350,6 +392,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
@@ -364,7 +407,133 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     debugPrint('📩 JSON keys: ${json.keys}');
     debugPrint('🔍 sender: "${json['sender']}"');
 
-    String transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
+    // Capture session ID from any event
+    final session = json['session'] as String?;
+    if (session != null && session.isNotEmpty) {
+      _sseSessionId = session;
+      debugPrint('📌 Captured session ID: $_sseSessionId');
+    }
+
+    final sender = json['sender'] ?? '';
+    final isUnstable = json['unstable'] == true;
+    final start = json['start']?.toString() ?? '';
+
+    String transcriptText = '';
+    Uint8List? audioBytes;
+
+    // ---------- TTS messages (audio + text) ----------
+    if (sender.startsWith('tts:')) {
+      final text = json['text'] as String?;
+      if (text == null || text.trim().isEmpty) {
+        debugPrint('⏭️ Skipping TTS with empty text');
+        return;
+      }
+      transcriptText = _cleanTranscript(text);
+
+      final audioUrlPath = json['b64_enc_pcm_s16le'] as String?;
+      if (audioUrlPath != null) {
+        try {
+          String audioUrl = audioUrlPath.startsWith('http')
+              ? audioUrlPath
+              : '$_baseUrl$audioUrlPath';
+
+          // Add all possible session identifiers as query parameters
+          final uri = Uri.parse(audioUrl);
+          final params = Map<String, String>.from(uri.queryParameters);
+          if (_sseSessionId != null) {
+            params['session'] = _sseSessionId!;
+            params['sid'] = _sseSessionId!;
+            params['channel'] = _sseSessionId!;
+            params['token'] = _sseSessionId!;
+            params['stream'] = _sseSessionId!;
+          }
+          audioUrl = uri.replace(queryParameters: params).toString();
+
+          debugPrint('🎵 Fetching audio from: $audioUrl');
+
+          final headers = {
+            ..._browserHeaders(),
+          };
+          if (widget.originalUrl != null) {
+            headers['Referer'] = widget.originalUrl!;
+            headers['Origin'] = _baseUrl!;
+          }
+          // Try all possible authentication headers
+          if (_sseSessionId != null) {
+            headers['X-Session-Id'] = _sseSessionId!;
+            headers['X-Stream-Id'] = _sseSessionId!;
+            headers['Authorization'] = 'Bearer $_sseSessionId';
+            headers['X-Token'] = _sseSessionId!;
+          }
+
+          debugPrint('📦 Headers: $headers');
+
+          final response = await _httpClient.get(
+            Uri.parse(audioUrl),
+            headers: headers,
+          ).timeout(const Duration(seconds: 15));
+
+          if (response.statusCode == 200) {
+            audioBytes = response.bodyBytes;
+            debugPrint('✅ Downloaded audio: ${audioBytes.length} bytes');
+          } else {
+            debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
+          }
+        } catch (e) {
+          debugPrint('❌ Error fetching audio: $e');
+        }
+      } else {
+        debugPrint('⚠️ No audio URL in TTS message');
+      }
+
+      // Add to language filter
+      const language = 'TTS';
+      _availableLanguages.add(language);
+      if (!_defaultFilterSet) {
+        if (mounted) {
+          setState(() {
+            _selectedLanguage = language;
+            _defaultFilterSet = true;
+          });
+        }
+      }
+
+      final key = 'tts_${json['message_id'] ?? DateTime.now().millisecondsSinceEpoch}';
+
+      _messagesMap[key] = TranscriptMessage(
+        transcript: transcriptText,
+        translations: {},
+        timestamp: DateTime.now(),
+        language: language,
+        isUnstable: isUnstable,
+        audioData: audioBytes,
+      );
+
+      if (_transcriptsRef != null) {
+        try {
+          await _transcriptsRef!.add({
+            'transcript': transcriptText,
+            'translations': {},
+            'timestamp': Timestamp.fromDate(DateTime.now()),
+            'language': language,
+            'isUnstable': isUnstable,
+          });
+        } catch (e) {
+          debugPrint('⚠️ Could not save to Firestore: $e');
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _isConnected = true;
+        _isConnecting = false;
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    // ---------- All other messages (no audio) ----------
+    transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
     transcriptText = _cleanTranscript(transcriptText);
 
     if (transcriptText.isEmpty) {
@@ -372,7 +541,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
 
-    final sender = json['sender'] ?? '';
     final language = _extractLanguageFromSender(sender);
 
     if (!language.contains('Audio') && !language.contains('Correction')) {
@@ -380,12 +548,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
 
     if (!_defaultFilterSet && !language.contains('Audio') && !language.contains('Correction')) {
-      _selectedLanguage = language;
-      _defaultFilterSet = true;
+      if (mounted) {
+        setState(() {
+          _selectedLanguage = language;
+          _defaultFilterSet = true;
+        });
+      }
     }
-
-    final isUnstable = json['unstable'] == true;
-    final start = json['start']?.toString() ?? '';
 
     String key;
     if (start.isNotEmpty) {
@@ -397,24 +566,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       key = '$sender|$textPrefix';
     }
 
-    // Extract audio data if present
-    Uint8List? audioBytes;
-    final audioBase64 = json['audio'] as String?;
-    if (audioBase64 != null) {
-      try {
-        audioBytes = base64Decode(audioBase64);
-      } catch (e) {
-        debugPrint('Failed to decode audio: $e');
-      }
-    }
-
     _messagesMap[key] = TranscriptMessage(
       transcript: transcriptText,
       translations: {},
       timestamp: DateTime.now(),
       language: language,
       isUnstable: isUnstable,
-      audioData: audioBytes,
+      audioData: null,
     );
 
     if (_transcriptsRef != null) {
@@ -425,13 +583,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           'timestamp': Timestamp.fromDate(DateTime.now()),
           'language': language,
           'isUnstable': isUnstable,
-          // optionally store audio? (might be large – skip or handle separately)
         });
       } catch (e) {
         debugPrint('⚠️ Could not save to Firestore: $e');
       }
     }
 
+    if (!mounted) return;
     setState(() {
       _isConnected = true;
       _isConnecting = false;
@@ -439,27 +597,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _scrollToBottom();
   }
 
-  void _reconnect() {
-    _channel?.sink.close();
-    _sseSubscription?.cancel();
-    _sseSubscription = null;
-    _connect(widget.resolvedUrl);
-  }
-
   Future<void> _playPause(String key, Uint8List audioData) async {
     if (_playingKey == key) {
       if (_isAudioPlaying) {
         await _audioPlayer.pause();
+        if (!mounted) return;
         setState(() => _isAudioPlaying = false);
       } else {
         await _audioPlayer.resume();
+        if (!mounted) return;
         setState(() => _isAudioPlaying = true);
       }
     } else {
-      // Stop any current playback
       await _audioPlayer.stop();
+      if (!mounted) return;
       setState(() {
-        // Reset progress for previous key (optional)
         _playingKey = null;
         _isAudioPlaying = false;
       });
@@ -467,6 +619,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       try {
         await _audioPlayer.setSourceBytes(audioData);
         await _audioPlayer.resume();
+        if (!mounted) return;
         setState(() {
           _playingKey = key;
           _isAudioPlaying = true;
@@ -474,7 +627,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         });
       } catch (e) {
         debugPrint('Error playing audio: $e');
-        // Optionally show a snackbar
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Audio playback error: $e')),
+        );
       }
     }
   }
@@ -487,9 +643,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _sseSubscription?.cancel();
     _sseSubscription = null;
     await _audioPlayer.stop();
-    if (mounted) {
-      Navigator.pushReplacementNamed(context, '/scan');
-    }
+    if (!mounted) return;
+    Navigator.pushReplacementNamed(context, '/scan');
   }
 
   @override
@@ -499,16 +654,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _sseSubscription = null;
     _audioPlayer.dispose();
     _scrollController.dispose();
+    _httpClient.close();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // Get sorted keys by timestamp
     final sortedKeys = _messagesMap.keys.toList()
       ..sort((a, b) => _messagesMap[a]!.timestamp.compareTo(_messagesMap[b]!.timestamp));
 
-    // Filter by selected language
     final filteredKeys = sortedKeys.where((key) {
       final msg = _messagesMap[key]!;
       return _selectedLanguage == null ||
@@ -550,7 +704,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       ),
       body: Column(
         children: [
-          // Status bar (unchanged)
           Container(
             padding: const EdgeInsets.all(8),
             color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
@@ -596,7 +749,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               ],
             ),
           ),
-          // List of message cards
           Expanded(
             child: filteredKeys.isEmpty
                 ? Center(
@@ -617,43 +769,47 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                       return Card(
                         margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                         child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
                             children: [
-                              Text(
-                                message.transcript,
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  color: message.isUnstable ? Colors.grey : Colors.black,
+                              Expanded(
+                                child: Text(
+                                  message.transcript,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    color: message.isUnstable ? Colors.grey : Colors.black,
+                                  ),
                                 ),
                               ),
                               if (hasAudio) ...[
-                                const SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    IconButton(
-                                      icon: Icon(
-                                        _playingKey == key && _isAudioPlaying
-                                            ? Icons.pause
-                                            : Icons.play_arrow,
-                                      ),
-                                      onPressed: () => _playPause(key, message.audioData!),
-                                    ),
-                                    Expanded(
-                                      child: LinearProgressIndicator(
-                                        value: _progressMap[key] ?? 0.0,
-                                        backgroundColor: Colors.grey[300],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      _durationMap[key] != null
-                                          ? '${_durationMap[key]!.inSeconds}s'
-                                          : '',
-                                      style: const TextStyle(fontSize: 12),
-                                    ),
-                                  ],
+                                const SizedBox(width: 8),
+                                IconButton(
+                                  icon: Icon(
+                                    _playingKey == key && _isAudioPlaying
+                                        ? Icons.pause
+                                        : Icons.play_arrow,
+                                  ),
+                                  onPressed: () => _playPause(key, message.audioData!),
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(),
+                                ),
+                                const SizedBox(width: 4),
+                                SizedBox(
+                                  width: 60,
+                                  child: LinearProgressIndicator(
+                                    value: _progressMap[key] ?? 0.0,
+                                    backgroundColor: Colors.grey[300],
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _durationMap[key] != null
+                                      ? '${_durationMap[key]!.inSeconds}s'
+                                      : '',
+                                  style: const TextStyle(fontSize: 12),
                                 ),
                               ],
                             ],
