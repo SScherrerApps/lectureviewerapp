@@ -2,7 +2,6 @@ import 'package:asr_live_translator/screens/session_selection_screen.dart';
 import 'package:firebase_core/firebase_core.dart';  // ✅ correct
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform;
-// ✅ REMOVED the broken duplicate import
 import 'screens/qr_scanner_screen.dart';
 import 'screens/live_transcript_screen.dart';
 import 'screens/silent_auth_screen.dart';

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
-import 'package:webview_flutter/webview_flutter.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'live_transcript_screen.dart';
 
@@ -19,9 +19,15 @@ class SilentAuthScreen extends StatefulWidget {
 }
 
 class _SilentAuthScreenState extends State<SilentAuthScreen> {
-  late WebViewController _controller;
+  InAppWebViewController? _controller;
+  bool _isLoading = true;
   bool _isAuthenticated = false;
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
+
+  @override
+  void initState() {
+    super.initState();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -30,30 +36,39 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
         title: const Text('Loading…'),
         automaticallyImplyLeading: false,
       ),
-      body: WebView(
-        initialUrl: widget.originalUrl,
-        javascriptMode: JavascriptMode.unrestricted,
-        onWebViewCreated: (WebViewController controller) {
+      body: InAppWebView(
+        initialUrlRequest: URLRequest(url: WebUri(widget.originalUrl)),
+        onWebViewCreated: (controller) {
           _controller = controller;
         },
-        onPageFinished: _onPageFinished,
-        onWebResourceError: (error) {
+        onLoadStop: (controller, url) async {
+          setState(() => _isLoading = false);
+          await _checkCookies(controller);
+        },
+        onLoadError: (controller, url, code, message) {
           if (kDebugMode) {
-            print('WebView error: $error');
+            print('WebView error: $code - $message');
           }
-          _showError('Failed to load the page.');
+          setState(() => _isLoading = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Failed to load the page. Please try again.')),
+          );
         },
       ),
     );
   }
 
-  Future<void> _onPageFinished(String url) async {
+  Future<void> _checkCookies(InAppWebViewController controller) async {
+    if (_isAuthenticated) return;
+
     try {
-      // v2 API: use runJavascriptReturningResult instead of deprecated evaluateJavascript.
-      final cookiesResult = await _controller.runJavascriptReturningResult('document.cookie');
-      final cookies = cookiesResult.replaceAll(RegExp(r'^"(.*)"$'), r'$1');
-      if (cookies.isNotEmpty && cookies.contains('_forward_auth_csrf')) {
-        await _storage.write(key: 'cookies', value: cookies);
+      final cookies = await controller.evaluateJavascript(
+        source: 'document.cookie',
+      );
+      if (cookies != null &&
+          cookies.isNotEmpty &&
+          cookies.toString().contains('_forward_auth_csrf')) {
+        await _storage.write(key: 'cookies', value: cookies.toString());
         if (mounted && !_isAuthenticated) {
           setState(() => _isAuthenticated = true);
           Navigator.pushReplacement(
@@ -66,19 +81,23 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
             ),
           );
         }
+      } else {
+        // Not authenticated – check again after 3 seconds
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted && !_isAuthenticated) {
+            _checkCookies(controller);
+          }
+        });
       }
     } catch (e) {
       if (kDebugMode) {
         print('Error extracting cookies: $e');
       }
-    }
-  }
-
-  void _showError(String message) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted && !_isAuthenticated) {
+          _checkCookies(controller);
+        }
+      });
     }
   }
 }
