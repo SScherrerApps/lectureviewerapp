@@ -39,6 +39,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   bool _isConnected = false;
   String? _errorMessage;
   bool _isConnecting = false;
+  int _reconnectAttempts = 0;
+  bool _reconnectScheduled = false;
 
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
@@ -54,7 +56,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   final http.Client _httpClient = http.Client();
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
 
-  // Store session ID from SSE events
   String? _sseSessionId;
   String? _baseUrl;
 
@@ -73,7 +74,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   @override
   void initState() {
     super.initState();
-    _checkAuth(); // new method
+    _checkAuth();
     if (kDebugMode) {
       print('🔗 SSE URL: ${widget.resolvedUrl}');
     }
@@ -86,10 +87,50 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _setupAudioListeners();
   }
 
+  // ========== Close session with cleanup (FIXED shadowing) ==========
+  Future<void> _closeSession({bool showConfirmation = true}) async {
+    if (showConfirmation) {
+      final confirm = await showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Leave session?'),
+          content: const Text('You will be disconnected and return to the session list.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Stay'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Leave'),
+            ),
+          ],
+        ),
+      );
+      if (confirm != true) return;
+    }
+
+    // Clean up connections
+    _channel?.sink.close();
+    _sseSubscription?.cancel();
+    _reconnectScheduled = false;
+    await _audioPlayer.stop();
+
+    if (mounted) {
+      Navigator.pop(context);
+    }
+  }
+
   Future<void> _checkAuth() async {
+    // 🌐 On web, the webview_windows plugin is not available.
+    // Skip the authentication check and proceed directly.
+    if (kIsWeb) {
+      debugPrint('🌐 Running on web – skipping authentication check.');
+      return;
+    }
+
     final cookies = await _secureStorage.read(key: 'cookies');
     if (cookies == null || cookies.isEmpty) {
-      // No cookies, navigate to auth screen
       if (mounted && widget.originalUrl != null) {
         Navigator.pushReplacementNamed(
           context,
@@ -110,7 +151,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         final duration = _durationMap[_playingKey];
         if (duration != null && duration.inMilliseconds > 0) {
           setState(() {
-            _progressMap[_playingKey!] = position.inMilliseconds / duration.inMilliseconds;
+            _progressMap[_playingKey!] =
+                position.inMilliseconds / duration.inMilliseconds;
           });
         }
       }
@@ -243,6 +285,31 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     };
   }
 
+  // ========== Reconnect with reset ==========
+  void _reconnect() {
+    _reconnectScheduled = false;
+    _reconnectAttempts = 0;
+    _channel?.sink.close();
+    _sseSubscription?.cancel();
+    _sseSubscription = null;
+
+    setState(() {
+      _messagesMap.clear();
+      _selectedLanguage = null;
+      _defaultFilterSet = false;
+      _errorMessage = null;
+      _isConnected = false;
+      _isConnecting = true;
+      _playingKey = null;
+      _isAudioPlaying = false;
+      _progressMap.clear();
+      _durationMap.clear();
+      _sseSessionId = null;
+    });
+
+    _connect(widget.resolvedUrl);
+  }
+
   void _connect(String url) {
     if (!mounted) return;
     setState(() {
@@ -266,11 +333,31 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
-  void _reconnect() {
-    _channel?.sink.close();
-    _sseSubscription?.cancel();
-    _sseSubscription = null;
-    _connect(widget.resolvedUrl);
+  // ========== Auto‑reconnect with Future.delayed ==========
+  void _scheduleReconnect() {
+    if (_reconnectScheduled) return;
+    if (_reconnectAttempts >= 3) {
+      debugPrint('❌ Max reconnect attempts reached. Showing Retry button.');
+      if (mounted) {
+        setState(() {
+          _isConnecting = false;
+          _errorMessage = 'Connection lost. Please tap Retry.';
+        });
+      }
+      return;
+    }
+
+    _reconnectAttempts++;
+    final delay = Duration(seconds: _reconnectAttempts * 2);
+    debugPrint('🔄 Scheduling reconnect attempt $_reconnectAttempts in ${delay.inSeconds}s');
+
+    _reconnectScheduled = true;
+    Future.delayed(delay, () {
+      _reconnectScheduled = false;
+      if (mounted && !_isConnected) {
+        _reconnect();
+      }
+    });
   }
 
   void _connectSSE(String url) {
@@ -313,6 +400,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           _isConnected = false;
           _isConnecting = false;
         });
+        _scheduleReconnect();
       }, onDone: () {
         debugPrint('🔌 SSE disconnected');
         if (!mounted) return;
@@ -320,12 +408,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           _isConnected = false;
           _isConnecting = false;
         });
+        _scheduleReconnect();
       });
       _sseSubscription = subscription;
       if (!mounted) return;
       setState(() {
         _isConnected = true;
         _isConnecting = false;
+        _reconnectAttempts = 0;
       });
     }).catchError((error) {
       debugPrint('❌ Failed to connect SSE: $error');
@@ -335,6 +425,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _isConnected = false;
         _isConnecting = false;
       });
+      _scheduleReconnect();
     });
   }
 
@@ -382,6 +473,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             _isConnected = false;
             _isConnecting = false;
           });
+          _scheduleReconnect();
         },
         onDone: () {
           debugPrint('🔌 WebSocket disconnected');
@@ -390,8 +482,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             _isConnected = false;
             _isConnecting = false;
           });
+          _scheduleReconnect();
         },
       );
+      setState(() {
+        _isConnected = true;
+        _isConnecting = false;
+        _reconnectAttempts = 0;
+      });
     } catch (e) {
       debugPrint('❌ Failed to connect WebSocket: $e');
       if (!mounted) return;
@@ -400,6 +498,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _isConnected = false;
         _isConnecting = false;
       });
+      _scheduleReconnect();
     }
   }
 
@@ -429,9 +528,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   Future<void> _handleMessage(Map<String, dynamic> json) async {
     debugPrint('📩 JSON keys: ${json.keys}');
-    debugPrint('🔍 sender: "${json['sender']}"');
+    debugPrint('🔍 sender: "${json["sender"]}"');
 
-    // Capture session ID from any event
     final session = json['session'] as String?;
     if (session != null && session.isNotEmpty) {
       _sseSessionId = session;
@@ -445,7 +543,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     String transcriptText = '';
     Uint8List? audioBytes;
 
-    // ---------- TTS messages (audio + text) ----------
     if (sender.startsWith('tts:')) {
       final text = json['text'] as String?;
       if (text == null || text.trim().isEmpty) {
@@ -461,7 +558,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               ? audioUrlPath
               : '$_baseUrl$audioUrlPath';
 
-          // Add all possible session identifiers as query parameters
           final uri = Uri.parse(audioUrl);
           final params = Map<String, String>.from(uri.queryParameters);
           if (_sseSessionId != null) {
@@ -483,13 +579,11 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             headers['Origin'] = _baseUrl!;
           }
 
-          // Read stored cookies from secure storage
           final String? cookies = await _secureStorage.read(key: 'cookies');
           if (cookies != null && cookies.isNotEmpty) {
             headers['Cookie'] = cookies;
           }
 
-          // Try all possible authentication headers
           if (_sseSessionId != null) {
             headers['X-Session-Id'] = _sseSessionId!;
             headers['X-Stream-Id'] = _sseSessionId!;
@@ -517,7 +611,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         debugPrint('⚠️ No audio URL in TTS message');
       }
 
-      // Add to language filter
       const language = 'TTS';
       _availableLanguages.add(language);
       if (!_defaultFilterSet) {
@@ -563,7 +656,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
 
-    // ---------- All other messages (no audio) ----------
     transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
     transcriptText = _cleanTranscript(transcriptText);
 
@@ -672,7 +764,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     await prefs.remove('session_id_${widget.resolvedUrl}');
     _channel?.sink.close();
     _sseSubscription?.cancel();
-    _sseSubscription = null;
+    _reconnectScheduled = false;
     await _audioPlayer.stop();
     if (!mounted) return;
     Navigator.pushReplacementNamed(context, '/scan');
@@ -680,6 +772,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   @override
   void dispose() {
+    _reconnectScheduled = false;
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _sseSubscription = null;
@@ -700,157 +793,205 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           msg.language.toLowerCase() == _selectedLanguage!.toLowerCase();
     }).toList();
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Live Transcript'),
-        actions: [
-          if (_availableLanguages.isNotEmpty)
-            DropdownButton<String>(
-              value: _selectedLanguage,
-              hint: const Text('All'),
-              items: [
-                const DropdownMenuItem<String>(
-                  value: null,
-                  child: Text('All (transcript)'),
-                ),
-                ..._availableLanguages.map((lang) {
-                  return DropdownMenuItem<String>(
-                    value: lang,
-                    child: Text(lang),
-                  );
-                }),
-              ],
-              onChanged: (newLang) {
-                setState(() {
-                  _selectedLanguage = newLang;
-                });
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (bool didPop, Object? result) async {
+        if (!didPop) {
+          await _closeSession(showConfirmation: true);
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: false,
+          leading: IconButton(
+            icon: const Icon(Icons.close),
+            onPressed: () => _closeSession(showConfirmation: true),
+            tooltip: 'Leave session',
+          ),
+          title: const Text('Live Transcript'),
+          actions: [
+            if (_availableLanguages.isNotEmpty)
+              DropdownButton<String>(
+                value: _selectedLanguage,
+                hint: const Text('All'),
+                items: [
+                  const DropdownMenuItem<String>(
+                    value: null,
+                    child: Text('All (transcript)'),
+                  ),
+                  ..._availableLanguages.map((lang) {
+                    return DropdownMenuItem<String>(
+                      value: lang,
+                      child: Text(lang),
+                    );
+                  }),
+                ],
+                onChanged: (newLang) {
+                  setState(() {
+                    _selectedLanguage = newLang;
+                  });
+                },
+              ),
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert),
+              onSelected: (value) {
+                if (value == 'scan') {
+                  _scanNewQR();
+                }
               },
-            ),
-          IconButton(
-            icon: const Icon(Icons.qr_code_scanner),
-            onPressed: _scanNewQR,
-            tooltip: 'Scan new QR',
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  _isConnected ? Icons.wifi : (_isConnecting ? Icons.wifi_lock : Icons.wifi_off),
-                  color: _isConnected ? Colors.green : (_isConnecting ? Colors.orange : Colors.red),
+              itemBuilder: (context) => [
+                const PopupMenuItem<String>(
+                  value: 'scan',
+                  child: Row(
+                    children: [
+                      Icon(Icons.qr_code_scanner),
+                      SizedBox(width: 8),
+                      Text('Scan new QR'),
+                    ],
+                  ),
                 ),
-                const SizedBox(width: 8),
-                Text(_isConnected ? 'Live connection' : (_isConnecting ? 'Connecting...' : 'Disconnected')),
-                if (_selectedLanguage != null) ...[
-                  const SizedBox(width: 12),
-                  Chip(
-                    label: Text('Filter: $_selectedLanguage'),
-                    backgroundColor: Colors.blue.shade100,
-                    deleteIcon: const Icon(Icons.close, size: 16),
-                    onDeleted: () {
-                      setState(() {
-                        _selectedLanguage = null;
-                      });
-                    },
-                  ),
-                ],
-                if (_errorMessage != null) ...[
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: Text(
-                      _errorMessage!,
-                      style: const TextStyle(color: Colors.red),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-                if (!_isConnected && !_isConnecting) ...[
-                  const SizedBox(width: 16),
-                  TextButton(
-                    onPressed: _reconnect,
-                    child: const Text('Retry'),
-                  ),
-                ],
               ],
             ),
-          ),
-          Expanded(
-            child: filteredKeys.isEmpty
-                ? Center(
-                    child: Text(
-                      _messagesMap.isEmpty
-                          ? 'Waiting for transcript...'
-                          : 'No messages in $_selectedLanguage',
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    itemCount: filteredKeys.length,
-                    itemBuilder: (context, index) {
-                      final key = filteredKeys[index];
-                      final message = _messagesMap[key]!;
-                      final hasAudio = message.audioData != null;
-
-                      return Card(
-                        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  message.transcript,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 16,
-                                    color: message.isUnstable ? Colors.grey : Colors.black,
-                                  ),
-                                ),
-                              ),
-                              if (hasAudio) ...[
-                                const SizedBox(width: 8),
-                                IconButton(
-                                  icon: Icon(
-                                    _playingKey == key && _isAudioPlaying
-                                        ? Icons.pause
-                                        : Icons.play_arrow,
-                                  ),
-                                  onPressed: () => _playPause(key, message.audioData!),
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(),
-                                ),
-                                const SizedBox(width: 4),
-                                SizedBox(
-                                  width: 60,
-                                  child: LinearProgressIndicator(
-                                    value: _progressMap[key] ?? 0.0,
-                                    backgroundColor: Colors.grey[300],
-                                  ),
-                                ),
-                                const SizedBox(width: 4),
-                                Text(
-                                  _durationMap[key] != null
-                                      ? '${_durationMap[key]!.inSeconds}s'
-                                      : '',
-                                  style: const TextStyle(fontSize: 12),
-                                ),
-                              ],
-                            ],
-                          ),
+          ],
+        ),
+        body: Column(
+          children: [
+            // -------- Status Bar with Close Button (always visible) --------
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  // Left side: connection status
+                  Row(
+                    children: [
+                      Icon(
+                        _isConnected ? Icons.wifi : (_isConnecting ? Icons.wifi_lock : Icons.wifi_off),
+                        color: _isConnected ? Colors.green : (_isConnecting ? Colors.orange : Colors.red),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(_isConnected ? 'Live connection' : (_isConnecting ? 'Connecting...' : 'Disconnected')),
+                      if (_selectedLanguage != null) ...[
+                        const SizedBox(width: 12),
+                        Chip(
+                          label: Text('Filter: $_selectedLanguage'),
+                          backgroundColor: Colors.blue.shade100,
+                          deleteIcon: const Icon(Icons.close, size: 16),
+                          onDeleted: () {
+                            setState(() {
+                              _selectedLanguage = null;
+                            });
+                          },
                         ),
-                      );
-                    },
+                      ],
+                    ],
                   ),
-          ),
-        ],
+                  // Right side: action buttons (Retry + Close)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (!_isConnected && !_isConnecting)
+                        TextButton(
+                          onPressed: _reconnect,
+                          child: const Text('Retry'),
+                        ),
+                      // Always show a close button in the status bar
+                      TextButton.icon(
+                        onPressed: () => _closeSession(showConfirmation: true),
+                        icon: const Icon(Icons.close, size: 18),
+                        label: const Text('Close'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.red,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            // -------- Error message (if any) --------
+            if (_errorMessage != null)
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Text(
+                  _errorMessage!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+              ),
+            // -------- Transcript List --------
+            Expanded(
+              child: filteredKeys.isEmpty
+                  ? Center(
+                      child: Text(
+                        _messagesMap.isEmpty
+                            ? 'Waiting for transcript...'
+                            : 'No messages in $_selectedLanguage',
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollController,
+                      itemCount: filteredKeys.length,
+                      itemBuilder: (context, index) {
+                        final key = filteredKeys[index];
+                        final message = _messagesMap[key]!;
+                        final hasAudio = message.audioData != null;
+
+                        return Card(
+                          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    message.transcript,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      color: message.isUnstable ? Colors.grey : Colors.black,
+                                    ),
+                                  ),
+                                ),
+                                if (hasAudio) ...[
+                                  const SizedBox(width: 8),
+                                  IconButton(
+                                    icon: Icon(
+                                      _playingKey == key && _isAudioPlaying
+                                          ? Icons.pause
+                                          : Icons.play_arrow,
+                                    ),
+                                    onPressed: () => _playPause(key, message.audioData!),
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  SizedBox(
+                                    width: 60,
+                                    child: LinearProgressIndicator(
+                                      value: _progressMap[key] ?? 0.0,
+                                      backgroundColor: Colors.grey[300],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _durationMap[key] != null
+                                        ? '${_durationMap[key]!.inSeconds}s'
+                                        : '',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }

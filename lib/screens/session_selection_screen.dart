@@ -905,13 +905,15 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
-  Future<void> _sharePdf(File pdfFile, String languageName) async {
-    await Share.shareXFiles(
-      [XFile(pdfFile.path)],
+Future<void> _sharePdf(File pdfFile, String languageName) async {
+  await SharePlus.instance.share(
+    ShareParams(
+      files: [XFile(pdfFile.path)],
       text: 'Lecture translation in $languageName',
       subject: 'Lecture Translation PDF',
-    );
-  }
+    ),
+  );
+}
 
   Future<void> _savePdfToDownloads(File pdfFile, String languageName) async {
     try {
