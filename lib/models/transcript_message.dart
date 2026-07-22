@@ -1,4 +1,3 @@
-// models/transcript_message.dart
 import 'dart:typed_data';
 
 class TranscriptMessage {
@@ -7,7 +6,8 @@ class TranscriptMessage {
   final DateTime timestamp;
   final String language;
   final bool isUnstable;
-  final Uint8List? audioData; // new
+  final Uint8List? audioData;   // used on non-web (downloaded bytes)
+  final String? audioUrl;       // used on web (direct URL)
 
   TranscriptMessage({
     required this.transcript,
@@ -16,5 +16,6 @@ class TranscriptMessage {
     required this.language,
     this.isUnstable = false,
     this.audioData,
+    this.audioUrl,
   });
 }
