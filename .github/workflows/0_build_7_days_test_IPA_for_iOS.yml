@@ -18,10 +18,53 @@ jobs:
       - run: flutter clean
       - run: flutter pub get
 
+      # --- Create/Patch ios/Podfile to require iOS 15.0 (required by Firebase) ---
+      - name: Set iOS deployment target to 15.0
+        run: |
+          # Ensure the ios folder exists
+          mkdir -p ios
+          # Generate a default Podfile if it doesn't exist
+          if [ ! -f "ios/Podfile" ]; then
+            echo "ios/Podfile not found. Creating one..."
+            cat > ios/Podfile << EOF
+platform :ios, '13.0'
+target 'Runner' do
+  use_frameworks!
+  use_modular_headers!
+  flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+end
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_ios_build_settings(target)
+  end
+end
+EOF
+          fi
+
+          # Now patch it to set platform to 15.0
+          echo "Patching ios/Podfile to set platform to 15.0..."
+          python3 -c "
+import re
+with open('ios/Podfile', 'r') as f:
+    content = f.read()
+# Replace any existing platform line with iOS 15.0
+pattern = r'^\\s*#?\\s*platform\\s+:ios\\s*,\\s*['\\\"](.*?)['\\\"]'
+if re.search(pattern, content, re.MULTILINE):
+    content = re.sub(pattern, \"platform :ios, '15.0'\", content, flags=re.MULTILINE)
+else:
+    # If no platform line is found, insert it at the top
+    content = \"platform :ios, '15.0'\n\" + content
+with open('ios/Podfile', 'w') as f:
+    f.write(content)
+"
+          # Verify the change
+          echo "--- Updated Podfile platform setting: ---"
+          grep "platform :ios" ios/Podfile || echo "WARNING: platform line not found!"
+
       # --- Add Firebase iOS configuration (required for Firebase Core/Auth/Firestore) ---
       - name: Create GoogleService-Info.plist
         run: |
-          # Store your Firebase iOS plist as a GitHub secret named FIREBASE_IOS_PLIST
+          mkdir -p ios/Runner
           echo "${{ secrets.FIREBASE_IOS_PLIST }}" > ios/Runner/GoogleService-Info.plist
 
       # --- Install Pods ---
