@@ -93,6 +93,10 @@ jobs:
             echo "Retry in 10s..."
             sleep 10
           done
+      
+      # --- Bump the generated Swift package to iOS 15.0 ---
+      - name: Bump FlutterGeneratedPluginSwiftPackage to iOS 15.0
+        run: flutter build ios --config-only
 
       # --- Build (unsigned) ---
       - name: Build iOS (unsigned)
