@@ -5,7 +5,9 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-14   # Xcode 15, avoids signing strictness
+    runs-on: macos-14
+    env:
+      FLUTTER_SUPPRESS_SWIFT_PACKAGE_MANAGER: "1"   # <-- suppresses SPM everywhere
     steps:
       - uses: actions/checkout@v4
 
@@ -15,7 +17,7 @@ jobs:
           architecture: x64
 
       - run: flutter clean
-      - run: flutter pub get
+      - run: flutter pub get          # now won't copy via rsync
 
       - name: Create GoogleService-Info.plist
         env:
@@ -32,16 +34,11 @@ jobs:
         working-directory: ios
         run: pod install --repo-update
 
-      # Ensure the build directory exists (safety net)
-      - name: Prepare build directory
-        run: mkdir -p build/ios/SourcePackages
-
       - name: Build unsigned IPA
         env:
           DEVELOPMENT_TEAM: "DUMMYTEAM"
           CODE_SIGN_STYLE: "Manual"
-        run: |
-          flutter build ios --release --no-codesign --no-swift-package-manager
+        run: flutter build ios --release --no-codesign --no-swift-package-manager
 
       - name: Package IPA
         working-directory: build/ios/iphoneos
