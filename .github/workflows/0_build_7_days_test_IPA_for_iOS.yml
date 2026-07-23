@@ -20,9 +20,11 @@ jobs:
 
       - run: flutter clean
 
-      # --- CREATE THE MISSING DIRECTORY BEFORE PUB GET ---
-      - name: Create SourcePackages directory
-        run: mkdir -p build/ios/SourcePackages
+      # --- CREATE BOTH DIRECTORIES BEFORE PUB GET ---
+      - name: Create SourcePackages directories for all platforms
+        run: |
+          mkdir -p build/ios/SourcePackages
+          mkdir -p build/macos/SourcePackages
 
       - run: flutter pub get                     # now rsync will succeed
 
