@@ -6,9 +6,9 @@ on:
 jobs:
   build-ios:
     name: 🎉 iOS Build (7-days free testing)
-    runs-on: macos-14                     # optional, but avoids Xcode 16 strictness
+    runs-on: macos-14                     # avoids Xcode 16 strictness
     env:
-      FLUTTER_SUPPRESS_SWIFT_PACKAGE_MANAGER: "1"   # <-- DISABLE SPM FOR ALL STEPS
+      FLUTTER_SUPPRESS_SWIFT_PACKAGE_MANAGER: "1"   # disable SPM globally
 
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +19,14 @@ jobs:
           architecture: x64
 
       - run: flutter clean
-      - run: flutter pub get                     # now won't try to copy via rsync
 
-      # --- (Optional) Patch Podfile to set dummy team and disable signing ---
+      # --- CREATE THE MISSING DIRECTORY BEFORE PUB GET ---
+      - name: Create SourcePackages directory
+        run: mkdir -p build/ios/SourcePackages
+
+      - run: flutter pub get                     # now rsync will succeed
+
+      # --- Patch Podfile to set dummy team and disable signing ---
       - name: Replace post_install block in Podfile
         run: |
           python3 << 'PYTHON'
