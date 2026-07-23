@@ -32,10 +32,16 @@ jobs:
         working-directory: ios
         run: pod install --repo-update
 
+      - name: Prepare build directory
+        run: |
+          mkdir -p build/ios/SourcePackages
+          flutter clean
+          flutter pub get
+
       - name: Build unsigned IPA
         env:
-          DEVELOPMENT_TEAM: "DUMMYTEAM"          # <-- dummy team ID (can be anything)
-          CODE_SIGN_STYLE: "Manual"              # <-- prevent auto‑fetch
+          DEVELOPMENT_TEAM: "DUMMYTEAM"
+          CODE_SIGN_STYLE: "Manual"
         run: flutter build ios --release --no-codesign
 
       - name: Package IPA
@@ -50,3 +56,4 @@ jobs:
           name: FlutterIpaExport.ipa
           path: build/ios/FlutterIpaExport.ipa
           retention-days: 7
+          
