@@ -74,12 +74,7 @@ jobs:
           mkdir -p ios/Runner
           printf '%s' "$FIREBASE_IOS_PLIST" > ios/Runner/GoogleService-Info.plist
 
-          - name: Regenerate iOS folder (clean fallback)
-            run: |
-              rm -rf ios
-              flutter create --platforms=ios .
-          
-          # --- Install Pods ---
+      # --- Install Pods ---
       - name: Update CocoaPods repository with retry
         working-directory: ios
         run: |
@@ -97,7 +92,7 @@ jobs:
             pod install --repo-update && break
             echo "Retry in 10s..."
             sleep 10
-          done     
+          done
 
       # --- Generate iOS config with iOS 15.0 (no signing) ---
       - name: Generate iOS config with iOS 15.0
