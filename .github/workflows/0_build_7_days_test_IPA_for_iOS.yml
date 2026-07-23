@@ -5,7 +5,7 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-14   # instead of macos-latest
+    runs-on: macos-14   # downgraded to avoid Xcode 16 strictness
     steps:
       - uses: actions/checkout@v4
 
@@ -32,11 +32,8 @@ jobs:
         working-directory: ios
         run: pod install --repo-update
 
-      - name: Prepare build directory
-        run: |
-          mkdir -p build/ios/SourcePackages
-          flutter clean
-          flutter pub get
+      - name: Ensure SourcePackages directory exists
+        run: mkdir -p build/ios/SourcePackages
 
       - name: Build unsigned IPA
         env:
