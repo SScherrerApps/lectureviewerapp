@@ -18,16 +18,49 @@ jobs:
       - run: flutter clean
       - run: flutter pub get
 
-      # --- (Optionally) Regenerate iOS folder ---
-      - name: Regenerate iOS folder (if needed)
+      # --- Regenerate iOS folder (ensures clean state) ---
+      - name: Regenerate iOS folder
         run: |
           rm -rf ios
           flutter create --platforms=ios .
 
       # --- Patch Podfile to iOS 15.0 ---
-      - name: Set iOS deployment target to 15.0
+      - name: Set iOS deployment target to 15.0 in Podfile
         run: |
-          # ... (your existing Podfile patching code) ...
+          if [ ! -f "ios/Podfile" ]; then
+            echo "ios/Podfile not found. Creating one..."
+            cat > ios/Podfile << EOF
+          platform :ios, '15.0'
+          target 'Runner' do
+            use_frameworks!
+            use_modular_headers!
+            flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+          end
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              flutter_additional_ios_build_settings(target)
+            end
+          end
+          EOF
+          else
+            sed -i '' 's/platform :ios, .*/platform :ios, '\''15.0'\''/' ios/Podfile
+          fi
+          echo "Podfile platform set to 15.0"
+
+      # --- Patch Xcode project deployment target to 15.0 ---
+      - name: Set Xcode project deployment target to 15.0
+        run: |
+          PROJECT_FILE="ios/Runner.xcodeproj/project.pbxproj"
+          if [ -f "$PROJECT_FILE" ]; then
+            # Replace all IPHONEOS_DEPLOYMENT_TARGET values with 15.0
+            sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]\+;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g' "$PROJECT_FILE"
+            # Also replace any deployment target in build settings
+            sed -i '' 's/DEPLOYMENT_TARGET = [0-9.]\+;/DEPLOYMENT_TARGET = 15.0;/g' "$PROJECT_FILE"
+            echo "Xcode project deployment target set to 15.0"
+            grep -E "IPHONEOS_DEPLOYMENT_TARGET|DEPLOYMENT_TARGET" "$PROJECT_FILE" | head -5
+          else
+            echo "WARNING: project.pbxproj not found"
+          fi
 
       # --- Create Firebase plist ---
       - name: Create GoogleService-Info.plist
@@ -50,12 +83,21 @@ jobs:
       - name: Generate iOS config with iOS 15.0
         run: flutter build ios --config-only --no-codesign
 
-      # --- Manual patch fallback ---
-      - name: Manual patch FlutterGeneratedPluginSwiftPackage
+      # --- Patch FlutterGeneratedPluginSwiftPackage (reliable method) ---
+      - name: Patch FlutterGeneratedPluginSwiftPackage
         run: |
           PACKAGE_FILE="ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage/Package.swift"
           if [ -f "$PACKAGE_FILE" ]; then
+            echo "Patching $PACKAGE_FILE..."
+            # Replace iOS 13.0 with 15.0
             sed -i '' 's/.iOS("13.0")/.iOS("15.0")/g' "$PACKAGE_FILE"
+            # Also replace any other version if needed
+            sed -i '' 's/.iOS("[0-9.]\+")/.iOS("15.0")/g' "$PACKAGE_FILE"
+            echo "Patched Package.swift:"
+            grep -A2 "platforms" "$PACKAGE_FILE" || echo "Could not find platforms section"
+          else
+            echo "ERROR: Package.swift not found!"
+            exit 1
           fi
 
       # --- Final unsigned build ---
@@ -90,3 +132,4 @@ jobs:
           name: FlutterIpaExport.ipa
           path: build/ios/FlutterIpaExport.ipa
           retention-days: 7
+          
