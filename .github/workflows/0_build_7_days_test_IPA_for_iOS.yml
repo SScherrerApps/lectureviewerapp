@@ -18,87 +18,47 @@ jobs:
       - run: flutter clean
       - run: flutter pub get
 
-      # --- Create/Patch ios/Podfile to require iOS 15.0 (required by Firebase) ---
+      # --- (Optionally) Regenerate iOS folder ---
+      - name: Regenerate iOS folder (if needed)
+        run: |
+          rm -rf ios
+          flutter create --platforms=ios .
+
+      # --- Patch Podfile to iOS 15.0 ---
       - name: Set iOS deployment target to 15.0
         run: |
-          # Ensure the ios folder exists
-          mkdir -p ios
-          # Generate a default Podfile if it doesn't exist
-          if [ ! -f "ios/Podfile" ]; then
-            echo "ios/Podfile not found. Creating one..."
-            cat > ios/Podfile << EOF
-          platform :ios, '13.0'
-          target 'Runner' do
-            use_frameworks!
-            use_modular_headers!
-            flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
-          end
-          post_install do |installer|
-            installer.pods_project.targets.each do |target|
-              flutter_additional_ios_build_settings(target)
-            end
-          end
-          EOF
-          fi
+          # ... (your existing Podfile patching code) ...
 
-          # Now patch it to set platform to 15.0 using a heredoc (no quote issues)
-          echo "Patching ios/Podfile to set platform to 15.0..."
-          python3 << 'PYTHON'
-          import re
-          with open('ios/Podfile', 'r') as f:
-              content = f.read()
-          # Replace any existing platform line with iOS 15.0
-          pattern = r'^\s*#?\s*platform\s+:ios\s*,\s*[\'"](.*?)[\'"]'
-          if re.search(pattern, content, re.MULTILINE):
-              content = re.sub(pattern, "platform :ios, '15.0'", content, flags=re.MULTILINE)
-          else:
-              # If no platform line is found, insert it at the top
-              content = "platform :ios, '15.0'\n" + content
-          with open('ios/Podfile', 'w') as f:
-              f.write(content)
-          PYTHON
-
-          # Verify the change
-          echo "--- Updated Podfile platform setting: ---"
-          grep "platform :ios" ios/Podfile || echo "WARNING: platform line not found!"
-
-      # --- Add Firebase iOS configuration (required for Firebase Core/Auth/Firestore) ---
+      # --- Create Firebase plist ---
       - name: Create GoogleService-Info.plist
         env:
           FIREBASE_IOS_PLIST: ${{ secrets.FIREBASE_IOS_PLIST }}
         run: |
           if [ -z "$FIREBASE_IOS_PLIST" ]; then
-            echo "ERROR: FIREBASE_IOS_PLIST secret is not set. Please add it."
+            echo "ERROR: FIREBASE_IOS_PLIST secret is not set."
             exit 1
           fi
           mkdir -p ios/Runner
           printf '%s' "$FIREBASE_IOS_PLIST" > ios/Runner/GoogleService-Info.plist
 
       # --- Install Pods ---
-      - name: Update CocoaPods repository with retry
+      - name: Install CocoaPods dependencies
         working-directory: ios
-        run: |
-          for i in {1..3}; do
-            echo "Attempt $i: Updating CocoaPods repository..."
-            pod repo update && break
-            sleep 5
-          done
+        run: pod install --repo-update
 
-      - name: Install CocoaPods dependencies with retry
-        working-directory: ios
-        run: |
-          for i in {1..5}; do
-            echo "Attempt $i: Running pod install..."
-            pod install --repo-update && break
-            echo "Retry in 10s..."
-            sleep 10
-          done
-
-      # --- Generate iOS config with iOS 15.0 (no signing) ---
+      # --- Generate config (triggers migration) ---
       - name: Generate iOS config with iOS 15.0
         run: flutter build ios --config-only --no-codesign
 
-      # --- Build (unsigned) ---
+      # --- Manual patch fallback ---
+      - name: Manual patch FlutterGeneratedPluginSwiftPackage
+        run: |
+          PACKAGE_FILE="ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage/Package.swift"
+          if [ -f "$PACKAGE_FILE" ]; then
+            sed -i '' 's/.iOS("13.0")/.iOS("15.0")/g' "$PACKAGE_FILE"
+          fi
+
+      # --- Final unsigned build ---
       - name: Build iOS (unsigned)
         run: flutter build ios --release --no-codesign
 
